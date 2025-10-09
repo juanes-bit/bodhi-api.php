@@ -166,6 +166,73 @@ function bodhi_require_login() {
   return is_user_logged_in();
 }
 
+function bodhi_tva_get_user_courses_filtered($page = 1, $per_page = 12, $owned_only = true) {
+  $page = max(1, (int) $page);
+  $per_page = min(50, max(1, (int) $per_page));
+
+  $req = new WP_REST_Request('GET', '/tva/v2/courses');
+  $req->set_param('status', 'published');
+  $req->set_param('page', $page);
+  $req->set_param('per_page', $per_page);
+
+  $res = rest_do_request($req);
+  if (is_wp_error($res)) {
+    return $res;
+  }
+  if (!($res instanceof WP_REST_Response)) {
+    return new WP_Error('bodhi_tva_bad_response', 'Respuesta inesperada de Thrive Apprentice');
+  }
+
+  $data    = $res->get_data();
+  $headers = $res->get_headers();
+
+  $out = [];
+  foreach ((array) $data as $c) {
+    $has_access = false;
+    if (isset($c['has_access'])) {
+      $has_access = (bool) $c['has_access'];
+    } elseif (isset($c['access'])) {
+      $has_access = in_array((string) $c['access'], ['owned', 'member', 'free'], true);
+    }
+
+    if ($owned_only && !$has_access) {
+      continue;
+    }
+
+    $title = '';
+    if (isset($c['title'])) {
+      if (is_array($c['title']) && isset($c['title']['rendered'])) {
+        $title = wp_strip_all_tags((string) $c['title']['rendered']);
+      } else {
+        $title = wp_strip_all_tags((string) $c['title']);
+      }
+    }
+
+    $thumb = $c['cover']['url'] ?? ($c['featured_image'] ?? null);
+    $course_id = (int) ($c['id'] ?? $c['ID'] ?? 0);
+    if ($course_id <= 0) {
+      continue;
+    }
+
+    $out[] = [
+      'id'     => $course_id,
+      'title'  => $title !== '' ? $title : ('Curso #' . $course_id),
+      'slug'   => (string) ($c['slug'] ?? ''),
+      'thumb'  => $thumb ?: null,
+      'access' => (string) ($c['access'] ?? ($has_access ? 'owned' : 'locked')),
+    ];
+  }
+
+  $resp = new WP_REST_Response($out, 200);
+  if (isset($headers['X-WP-Total'])) {
+    $resp->header('X-WP-Total', $headers['X-WP-Total']);
+  }
+  if (isset($headers['X-WP-TotalPages'])) {
+    $resp->header('X-WP-TotalPages', $headers['X-WP-TotalPages']);
+  }
+  return $resp;
+}
+
 function bodhi_create_enrollments_table() {
   global $wpdb;
   $table = $wpdb->prefix . 'bodhi_enrollments';
@@ -682,51 +749,26 @@ function bodhi_enrollments_get_course_ids($user_id, $page, $per_page, $owned_onl
 }
 
 function bodhi_rest_get_courses(WP_REST_Request $req) {
-  $user_id = get_current_user_id();
-  if (!$user_id) {
+  if (!is_user_logged_in()) {
     return new WP_Error('forbidden', 'Auth requerida', ['status' => 401]);
   }
 
-  $page = max(1, (int) $req->get_param('page'));
-  $per_page = min(50, max(1, (int) $req->get_param('per_page')));
-  $owned = wp_validate_boolean($req->get_param('owned'));
+  $page = max(1, (int) ($req->get_param('page') ?: 1));
+  $per_page = min(50, max(1, (int) ($req->get_param('per_page') ?: 12)));
 
-  [$course_ids, $total] = bodhi_enrollments_get_course_ids($user_id, $page, $per_page, $owned !== false);
-
-  $total_pages = $per_page > 0 ? ceil($total / $per_page) : 0;
-  $server = rest_get_server();
-  if ($server) {
-    $server->send_header('X-WP-Total', (int) $total);
-    $server->send_header('X-WP-TotalPages', (int) $total_pages);
-  } else {
-    header('X-WP-Total: ' . (int) $total);
-    header('X-WP-TotalPages: ' . (int) $total_pages);
-  }
-  if (empty($course_ids)) {
-    return rest_ensure_response([]);
+  $resp = bodhi_tva_get_user_courses_filtered($page, $per_page);
+  if ($resp instanceof WP_REST_Response) {
+    $headers = $resp->get_headers();
+    $data = $resp->get_data();
+    if (empty($headers['X-WP-Total'])) {
+      $resp->header('X-WP-Total', (string) count($data));
+    }
+    if (empty($headers['X-WP-TotalPages'])) {
+      $resp->header('X-WP-TotalPages', '1');
+    }
   }
 
-  $post_type = bodhi_get_course_pt();
-  $query = new WP_Query([
-    'post_type'      => $post_type,
-    'post__in'       => $course_ids,
-    'orderby'        => 'post__in',
-    'posts_per_page' => count($course_ids),
-    'no_found_rows'  => true,
-  ]);
-
-  $items = [];
-  foreach ($query->posts as $p) {
-    $items[] = [
-      'id'     => (int) $p->ID,
-      'title'  => get_the_title($p),
-      'slug'   => $p->post_name,
-      'thumb'  => get_the_post_thumbnail_url($p, 'medium') ?: null,
-      'access' => 'owned',
-    ];
-  }
-
-  return rest_ensure_response($items);
+  return $resp;
 }
 
 function bodhi_outline_from_thrive(WP_REST_Request $req) {
