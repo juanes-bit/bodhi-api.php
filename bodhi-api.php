@@ -124,6 +124,66 @@ function bodhi_first($item, array $paths) {
   return null;
 }
 
+function bodhi_parse_vimeo($url){
+  if (!is_string($url) || $url === '') {
+    return null;
+  }
+  if (preg_match('#player\.vimeo\.com/video/(\d+)(?:.*[?&]h=([A-Za-z0-9]+))?#', $url, $m)) {
+    return ['id' => $m[1], 'h' => $m[2] ?? null];
+  }
+  if (preg_match('#vimeo\.com/(?:video/)?(\d+)(?:/([A-Za-z0-9]+))?#', $url, $m)) {
+    return ['id' => $m[1], 'h' => $m[2] ?? null];
+  }
+  return null;
+}
+
+// === Helpers mínimos ===
+function bodhi_fetch_json($path, $ttl = 120) {
+  static $cache = [];
+  $key = $path;
+  if (isset($cache[$key])) {
+    return $cache[$key];
+  }
+
+  $url  = home_url('/wp-json/' . ltrim($path, '/'));
+  $resp = wp_remote_get($url, ['timeout' => 10]);
+  if (is_wp_error($resp)) {
+    return ['ok' => false, 'code' => 0, 'data' => null, 'err' => $resp->get_error_message()];
+  }
+  $code = wp_remote_retrieve_response_code($resp);
+  $body = json_decode(wp_remote_retrieve_body($resp), true);
+  $out  = ['ok' => ($code === 200), 'code' => $code, 'data' => $body];
+  $cache[$key] = $out;
+  return $out;
+}
+
+function bodhi_is_staging() {
+  $host = parse_url(home_url(), PHP_URL_HOST);
+  return (strpos($host, 'staging.') !== false) || (defined('WP_ENV') && WP_ENV === 'staging');
+}
+
+function bodhi_require_login() {
+  return is_user_logged_in();
+}
+
+function bodhi_create_enrollments_table() {
+  global $wpdb;
+  $table = $wpdb->prefix . 'bodhi_enrollments';
+  $charset = $wpdb->get_charset_collate();
+  $sql = "CREATE TABLE IF NOT EXISTS {$table} (
+    id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    user_id BIGINT UNSIGNED NOT NULL,
+    course_id BIGINT UNSIGNED NOT NULL,
+    status VARCHAR(20) NOT NULL DEFAULT 'owned',
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE KEY user_course (user_id, course_id),
+    KEY course_user (course_id, user_id),
+    KEY status (status)
+  ) {$charset};";
+  require_once ABSPATH . 'wp-admin/includes/upgrade.php';
+  dbDelta($sql);
+}
+
 /**
  * Detecta el post_type de cursos de Thrive (si existe) DESPUÉS de init.
  * Fallback a CPT propio "course".
@@ -162,64 +222,19 @@ add_action('init', function () {
     'rewrite'=>['slug'=>'courses'],
   ]);
 }, 20); // aseguramos que Thrive registre primero (si existe)
-register_activation_hook(__FILE__, function(){ flush_rewrite_rules(); });
+register_activation_hook(__FILE__, function(){
+  bodhi_create_enrollments_table();
+  flush_rewrite_rules();
+});
 register_deactivation_hook(__FILE__, function(){ flush_rewrite_rules(); });
 
 add_action('rest_api_init', function () {
 
-  // === LESSONS NORMALIZADAS ===
+  // === LESSONS (deprecated, lectura vía Thrive) ===
   register_rest_route(BODHI_API_NS, '/lessons', [
     'methods'  => 'GET',
-    'permission_callback' => '__return_true',
-    'callback' => function (WP_REST_Request $req) {
-      $course_id = (int) $req->get_param('course_id');
-      if (!$course_id) {
-        return new WP_Error('bad_request', 'course_id requerido', ['status' => 400]);
-      }
-
-      // TODO: cambiar el origen por Thrive o CPT real según setup
-      $lessons = get_posts([
-        'post_type'   => 'lesson',
-        'post_status' => 'publish',
-        'numberposts' => -1,
-        'meta_query'  => [[
-          'key'     => 'course_id',
-          'value'   => $course_id,
-          'compare' => '=',
-        ]],
-        'orderby'     => 'menu_order',
-        'order'       => 'ASC',
-      ]);
-
-      $out = [];
-      foreach ($lessons as $p) {
-        $video  = get_post_meta($p->ID, 'video_url', true);
-        $poster = get_post_meta($p->ID, 'video_poster', true);
-        $blocks = [];
-
-        $blocks[] = ['type' => 'heading', 'text' => get_the_title($p)];
-        if (!empty($p->post_excerpt)) {
-          $blocks[] = ['type' => 'paragraph', 'text' => wp_strip_all_tags($p->post_excerpt)];
-        }
-
-        $thumb = get_the_post_thumbnail_url($p->ID, 'full');
-        if ($thumb) {
-          $blocks[] = ['type' => 'image', 'url' => $thumb, 'alt' => get_the_title($p)];
-        }
-
-        if ($video) {
-          $blocks[] = ['type' => 'video', 'url' => $video, 'poster' => $poster];
-        }
-
-        $out[] = [
-          'id'     => $p->ID,
-          'title'  => get_the_title($p),
-          'blocks' => $blocks,
-        ];
-      }
-
-      return rest_ensure_response($out);
-    }
+    'callback' => 'bodhi_lessons_from_thrive',
+    'permission_callback' => 'bodhi_require_login',
   ]);
 
   if (!function_exists('bodhi_token_key')) {
@@ -321,8 +336,11 @@ add_action('rest_api_init', function () {
   // ========== DEBUGS (para ver el payload real de Thrive) ==========
   register_rest_route(BODHI_API_NS, '/debug/products', [
     'methods' => 'GET',
-    'permission_callback' => '__return_true',
+    'permission_callback' => 'bodhi_require_login',
     'callback' => function(){
+      if (!bodhi_is_staging() || !current_user_can('manage_options')) {
+        return new WP_Error('forbidden', 'debug solo en staging/admin', ['status' => 403]);
+      }
       $uid = get_current_user_id();
       $res = bodhi_rest_proxy_request('GET', '/tva/v1/customer/'.$uid.'/products', [], ['impersonate_admin' => true]);
       return $res['ok'] ? $res['data'] : $res;
@@ -331,8 +349,11 @@ add_action('rest_api_init', function () {
 
   register_rest_route(BODHI_API_NS, '/debug/prod/(?P<pid>\d+)/courses', [
     'methods' => 'GET',
-    'permission_callback' => '__return_true',
+    'permission_callback' => 'bodhi_require_login',
     'callback' => function(WP_REST_Request $req){
+      if (!bodhi_is_staging() || !current_user_can('manage_options')) {
+        return new WP_Error('forbidden', 'debug solo en staging/admin', ['status' => 403]);
+      }
       $pid = (int)$req->get_param('pid');
       $res = bodhi_rest_proxy_request('GET', '/tva/v1/products/'.$pid.'/courses', [
         'per_page' => 100,
@@ -344,8 +365,11 @@ add_action('rest_api_init', function () {
 
   register_rest_route(BODHI_API_NS, '/debug/prod/(?P<pid>\d+)/sets', [
     'methods' => 'GET',
-    'permission_callback' => '__return_true',
+    'permission_callback' => 'bodhi_require_login',
     'callback' => function(WP_REST_Request $req){
+      if (!bodhi_is_staging() || !current_user_can('manage_options')) {
+        return new WP_Error('forbidden', 'debug solo en staging/admin', ['status' => 403]);
+      }
       $pid = (int)$req->get_param('pid');
       $res = bodhi_rest_proxy_request('GET', '/tva/v1/products/'.$pid.'/sets', [
         'per_page' => 100,
@@ -355,239 +379,34 @@ add_action('rest_api_init', function () {
     }
   ]);
 
-  // /bodhi/v1/courses — usa cookie+nonce y reporta __debug de Thrive
   register_rest_route('bodhi/v1', '/courses', [
     'methods'  => 'GET',
-    'permission_callback' => '__return_true',
-    'callback' => function (WP_REST_Request $req) {
-
-      $__had_ob = ob_get_level() > 0;
-      $noise = null;
-      if (!$__had_ob) ob_start();
-
-      try {
-        if (!is_user_logged_in()) {
-          throw new Exception('unauthorized', 401);
-        }
-        $uid   = get_current_user_id();
-        $debugAllowed = ((string)$req->get_param('debug') === '1') && current_user_can('manage_options');
-        $debug = $debugAllowed ? [] : null;
-        $cacheKey = 'bodhi:courses:'.$uid;
-
-        if (!$debugAllowed) {
-          $cachedItems = get_transient($cacheKey);
-          if (is_array($cachedItems)) {
-            if (!$__had_ob) ob_end_clean();
-            return new WP_REST_Response(['items'=>$cachedItems], 200);
-          }
-        }
-        $out   = [];
-        $seen  = [];
-
-        $p = bodhi_rest_proxy_request('GET', '/tva/v1/customer/'.$uid.'/products', [], ['impersonate_admin'=>true]);
-        if ($debugAllowed) $debug['customer_products_status'] = $p['status'];
-        if (!$p['ok']) {
-          $payload = ['items'=>[]];
-          if ($debugAllowed) $payload['__debug'] = $debug;
-          if ($debugAllowed && !$__had_ob) {
-            $noise = ob_get_clean();
-            if (is_string($noise) && strlen(trim($noise)) > 0) $payload['__noise'] = $noise;
-          } elseif (!$__had_ob) {
-            ob_end_clean();
-          }
-          return new WP_REST_Response($payload, 200);
-        }
-
-        $products = $p['data'];
-        if (is_object($products)) {
-          if (isset($products->items)) {
-            $products = $products->items;
-          } else {
-            $products = [$products];
-          }
-        } elseif (is_array($products) && isset($products['items']) && is_array($products['items'])) {
-          $products = $products['items'];
-        } elseif (!is_array($products)) {
-          $products = (array)$products;
-        }
-        if ($debugAllowed && (string)$req->get_param('debug') === '1') {
-          $debug['customer_products_sample'] = $products;
-        }
-
-        $ids = [];
-        $stack = [$products];
-        while ($stack) {
-          $node = array_pop($stack);
-          if (!is_array($node)) continue;
-          $assoc = array_keys($node) !== range(0, count($node)-1);
-          if ($assoc) {
-            foreach (['product_id','tva_product_id','ID','id','post_id'] as $k) {
-              if (isset($node[$k]) && is_numeric($node[$k])) $ids[(int)$node[$k]] = true;
-            }
-            foreach ($node as $v) if (is_array($v)) $stack[] = $v;
-          } else {
-            foreach ($node as $v) if (is_array($v)) $stack[] = $v;
-          }
-        }
-        $product_ids = array_keys($ids);
-        $debug['product_ids_found'] = $product_ids;
-
-        foreach ($product_ids as $pid) {
-          $pc = bodhi_rest_proxy_request('GET', '/tva/v1/products/'.$pid.'/courses',
-            ['per_page'=>100,'context'=>'edit'],
-            ['impersonate_admin'=>true]
-          );
-          if ($debugAllowed) $debug['p_'.$pid.'_courses_status'] = $pc['status'];
-
-          if ($pc['ok'] && !empty($pc['data']) && is_iterable($pc['data'])) {
-            foreach ($pc['data'] as $ci) {
-              $cid = (int)(bodhi_first($ci, ['course_id','ID','id','get_id','get_ID']) ?? 0);
-              if ($cid <= 0 || isset($seen[$cid])) continue;
-
-              $title = (string)(bodhi_first($ci, [
-                'title.rendered','title','name','post_title','get_title','get_name'
-              ]) ?? '');
-              $slug = (string)(bodhi_first($ci, [
-                'slug','post_name','identifier','get_slug','get_identifier'
-              ]) ?? '');
-              $thumb = (string)(bodhi_first($ci, [
-                'featured_image','thumb','get_featured_image','get_thumb'
-              ]) ?? '');
-
-              if ($cid && ($title === '' || $slug === '')) {
-                if ($p_obj = get_post($cid)) {
-                  if ($title === '') $title = (string)$p_obj->post_title;
-                  if ($slug === '') $slug = (string)$p_obj->post_name;
-                }
-              }
-              if ($title === '') $title = 'Curso #'.$cid;
-
-              $out[] = [
-                'id'=>$cid,'title'=>$title,'slug'=>$slug,'thumb'=>$thumb ?: null,
-                'type'=>'tva_course','access'=>'owned',
-                'source'=>['product_id'=>$pid,'route'=>'/tva/v1/products/'.$pid.'/courses']
-              ];
-              $seen[$cid] = true;
-            }
-            continue;
-          }
-
-          $ps = bodhi_rest_proxy_request('GET', '/tva/v1/products/'.$pid.'/sets',
-            ['per_page'=>100,'context'=>'edit'],
-            ['impersonate_admin'=>true]
-          );
-          if ($debugAllowed) $debug['p_'.$pid.'_sets_status'] = $ps['status'];
-
-          if ($ps['ok'] && !empty($ps['data']) && is_iterable($ps['data'])) {
-            foreach ($ps['data'] as $s) {
-              $sid = (int)(bodhi_first($s, ['ID','id','get_id','get_ID']) ?? 0);
-              if ($sid <= 0 || isset($seen[$sid])) continue;
-
-              $title = (string)(bodhi_first($s, [
-                'title.rendered','title','name','post_title','get_title','get_name'
-              ]) ?? ('Content Set #'.$sid));
-
-              $out[] = [
-                'id'=>$sid,'title'=>$title,'slug'=>'content-set-'.$sid,'thumb'=>null,
-                'type'=>'tva_content_set','access'=>'owned',
-                'source'=>['product_id'=>$pid,'route'=>'/tva/v1/products/'.$pid.'/sets']
-              ];
-              $seen[$sid] = true;
-            }
-          }
-        }
-
-        usort($out, fn($a,$b)=>strcasecmp($a['title'],$b['title']));
-
-        if (!$debugAllowed) {
-          set_transient($cacheKey, $out, 3 * MINUTE_IN_SECONDS);
-        }
-
-        $payload = ['items'=>$out];
-        if ($debugAllowed) {
-          $payload['__debug'] = $debug;
-        }
-        if (!$__had_ob) {
-          $noise = ob_get_clean();
-          if ($debugAllowed && is_string($noise) && strlen(trim($noise)) > 0) $payload['__noise'] = $noise;
-        }
-        return new WP_REST_Response($payload, 200);
-
-      } catch (Throwable $e) {
-        if (!$__had_ob) {
-          $noise = ob_get_clean();
-        }
-        $payload = ['items' => []];
-        if ($debugAllowed) {
-          $payload['__debug'] = [
-            'exception' => $e->getMessage(),
-            'code'      => $e->getCode(),
-            'file'      => $e->getFile(),
-            'line'      => $e->getLine(),
-          ];
-          if (!empty($noise)) $payload['__noise'] = $noise;
-        }
-        return new WP_REST_Response($payload, $e->getCode() ?: 500);
-      }
-    }
+    'callback' => 'bodhi_rest_get_courses',
+    'permission_callback' => 'bodhi_require_login',
+    'args' => [
+      'owned' => ['type' => 'boolean', 'default' => true],
+      'page' => ['type' => 'integer', 'default' => 1, 'minimum' => 1],
+      'per_page' => ['type' => 'integer', 'default' => 12, 'minimum' => 1, 'maximum' => 50],
+    ],
   ]);
 
   // === PERFIL / ACCESOS (JWT) =============================================
   // === ÍNDICE DEL CURSO (outline) =========================================
   register_rest_route(BODHI_API_NS, '/outline', [
     'methods'  => 'GET',
-    'permission_callback' => '__return_true',
-    'callback' => function(WP_REST_Request $req){
-      $course_id = (int)$req->get_param('course_id');
-      if (!$course_id) return new WP_Error('bad_request','course_id requerido',['status'=>400]);
-
-      $module_type = post_type_exists('tva_module') ? 'tva_module' : 'tva_lesson';
-      $lesson_type = post_type_exists('tva_lesson') ? 'tva_lesson' : 'lesson';
-
-      $modules = get_posts([
-        'post_type'   => $module_type,
-        'post_status' => 'publish',
-        'numberposts' => -1,
-        'meta_query'  => [['key'=>'course_id','value'=>$course_id,'compare'=>'=']],
-        'orderby'     => 'menu_order',
-        'order'       => 'ASC'
-      ]);
-
-      $out = ['course_id'=>$course_id,'modules'=>[]];
-      foreach ($modules as $m) {
-        $lessons = get_posts([
-          'post_type'   => $lesson_type,
-          'post_status' => 'publish',
-          'numberposts' => -1,
-          'meta_query'  => [['key'=>'module_id','value'=>$m->ID,'compare'=>'=']],
-          'orderby'     => 'menu_order',
-          'order'       => 'ASC'
-        ]);
-
-        $out['modules'][] = [
-          'id'    => $m->ID,
-          'title' => get_the_title($m),
-          'lessons' => array_map(function($l){
-            return ['id'=>$l->ID,'title'=>get_the_title($l)];
-          }, $lessons)
-        ];
-      }
-
-      return rest_ensure_response($out);
-    }
+    'callback' => 'bodhi_outline_from_thrive',
+    'permission_callback' => 'bodhi_require_login',
   ]);
 
   // DEBUG SOLO STAGING: inspeccionar acceso real de Thrive para el usuario logueado
   register_rest_route(BODHI_API_NS, '/_debug-thrive', [
     'methods'  => 'GET',
-    'permission_callback' => '__return_true',
+    'permission_callback' => 'bodhi_require_login',
     'callback' => function (WP_REST_Request $req) {
+      if (!bodhi_is_staging() || !current_user_can('manage_options')) {
+        return new WP_Error('forbidden', 'debug solo en staging/admin', ['status' => 403]);
+      }
       try {
-        $host = $_SERVER['HTTP_HOST'] ?? ($_SERVER['SERVER_NAME'] ?? '');
-        if ( stripos($host, 'staging') === false ) {
-          return new WP_Error('forbidden','Solo en staging (host detectado: '.$host.')',['status'=>403]);
-        }
-
         $uid = get_current_user_id();
         $out = [
           'user_id' => $uid,
@@ -708,131 +527,14 @@ add_action('rest_api_init', function () {
     }
   ]);
 
-  // === DETALLE (con fallback si no existe traducción) ===
+  // === DETALLE NORMALIZADO (Thrive) ===
   register_rest_route(BODHI_API_NS, '/courses/(?P<id>\\d+)', [
-    'methods' => 'GET',
-    'permission_callback' => '__return_true',
-    'callback' => function (WP_REST_Request $req) {
-      $pt   = bodhi_get_course_pt();
-      $id   = (int)$req['id'];
-      $lang = $req->get_param('lang');
-
-      if ($lang && defined('ICL_SITEPRESS_VERSION')) {
-        do_action('wpml_switch_language', $lang);
-        $mapped = apply_filters('wpml_object_id', $id, $pt, true, $lang); // true => fallback a default
-        if (!empty($mapped)) $id = (int)$mapped;
-      }
-
-      $post = get_post($id);
-      if (!$post || get_post_type($post) !== $pt) {
-        return new WP_Error('not_found', 'Course not found', ['status'=>404]);
-      }
-
-      // Protección de acceso (MVP)
-      $uid = get_current_user_id();
-      $allowed = bodhi_user_can_access_course($uid, $id);
-      if (!$allowed) {
-        return new WP_Error('forbidden', 'No tienes acceso a este curso', ['status'=>403]);
-      }
-
-      $cover = get_the_post_thumbnail_url($id, 'large') ?: null;
-
-      /** —— LECCIONES: Thrive primero, ACF como fallback —— */
-      $lessons = [];
-
-      // 1) Si existe Thrive, localizar módulos por meta (tva_course_id/thrive_content_set/…)
-      if ($pt !== 'course') {
-        $candidate_keys = ['tva_course_id','tva_course','thrive_content_set','_thrive_content_set','course_id'];
-        $modules = [];
-        foreach ($candidate_keys as $mk) {
-          $mq = new WP_Query([
-            'post_type'      => 'tva_module',
-            'post_status'    => 'publish',
-            'posts_per_page' => -1,
-            'meta_query'     => [[ 'key'=>$mk, 'value'=>$id, 'compare'=>'=' ]],
-            'orderby'        => 'menu_order',
-            'order'          => 'ASC',
-          ]);
-          if ($mq->have_posts()) { $modules = $mq->posts; break; }
-        }
-        // fallback: jerarquía por parent (algunas setups la usan)
-        if (empty($modules)) {
-          $modules = get_children([
-            'post_parent' => $id,
-            'post_type'   => 'tva_module',
-            'post_status' => 'publish',
-            'orderby'     => 'menu_order',
-            'order'       => 'ASC',
-          ]);
-        }
-
-        foreach ($modules as $mod) {
-          $mod_id = is_object($mod) ? $mod->ID : (int)$mod;
-          $ls_q = get_children([
-            'post_parent' => $mod_id,
-            'post_type'   => 'tva_lesson',
-            'post_status' => 'publish',
-            'orderby'     => 'menu_order',
-            'order'       => 'ASC',
-          ]);
-          foreach ($ls_q as $l) {
-            $lid = $l->ID;
-            // URL candidata: tva_video > url > video_url > ACF url/video_url > permalink
-            $url = get_post_meta($lid, 'tva_video', true)
-                ?: get_post_meta($lid, 'url', true)
-                ?: get_post_meta($lid, 'video_url', true)
-                ?: (function_exists('get_field') ? (get_field('url', $lid) ?: get_field('video_url', $lid)) : '')
-                ?: get_permalink($lid);
-            // Tipo por meta o heurística
-            $type = get_post_meta($lid, 'tva_lesson_type', true);
-            if (!$type) {
-              $type = (preg_match('~(youtube|vimeo|\.mp4)~i', $url) ? 'video'
-                    : (preg_match('~/(form|formularios?)\\/?~i', $url) ? 'form' : 'article'));
-            }
-            $lessons[] = [
-              'title'  => get_the_title($lid),
-              'type'   => $type,
-              'url'    => $url,
-              'schema' => null,
-            ];
-          }
-        }
-      }
-
-      // 2) Fallback ACF en el curso si no se encontraron lecciones en Thrive
-      if (empty($lessons) && function_exists('get_field')) {
-        $acf_lessons = get_field('lessons', $id);
-        if ($acf_lessons && is_array($acf_lessons)) {
-          foreach ($acf_lessons as $ls) {
-            $lessons[] = [
-              'title'  => isset($ls['title']) ? $ls['title'] : '',
-              'type'   => isset($ls['type']) ? $ls['type'] : 'article',
-              'url'    => isset($ls['url']) ? $ls['url'] : '',
-              'schema' => (!empty($ls['schema']) && is_string($ls['schema']))
-                ? json_decode($ls['schema'], true)
-                : null,
-            ];
-          }
-        }
-      }
-
-      // 3) Portada desde ACF (si existe)
-      $cover_acf = function_exists('get_field') ? get_field('cover_image', $id) : null;
-      if ($cover_acf && is_array($cover_acf) && !empty($cover_acf['url'])) {
-        $cover = $cover_acf['url'];
-      }
-
-      return rest_ensure_response([
-        'id'      => $id,
-        'title'   => get_the_title($id),
-        'cover'   => $cover,
-        'link'    => get_permalink($id),
-        'lessons' => $lessons,
-      ]);
-    }
+    'methods'  => 'GET',
+    'callback' => 'bodhi_course_detail_normalized',
+    'permission_callback' => 'bodhi_require_login',
   ]);
 
-  // === NEWS ===
+// === NEWS ===
   register_rest_route(BODHI_API_NS, '/news', [
     'methods' => 'GET',
     'permission_callback' => '__return_true',
@@ -862,55 +564,377 @@ add_action('rest_api_init', function () {
   ]);
 });
 
+// === Progress summary centralizado ===
+function bodhi_progress_summary($course_id, $user_id = 0) {
+  $uid = $user_id ?: get_current_user_id();
+  $meta_key = 'bodhi_progress_' . (int) $course_id;
+  $progress = get_user_meta($uid, $meta_key, true);
+  if (!is_array($progress)) {
+    $progress = [];
+  }
+
+  $r = bodhi_fetch_json("tva-public/v1/course/{$course_id}/items");
+  $total = 0;
+  if (!empty($r['ok']) && is_array($r['data'] ?? null) && !empty($r['data']['lessons'])) {
+    $total = count($r['data']['lessons']);
+  }
+  if ($total <= 0) {
+    $total = max(1, count($progress));
+  }
+
+  $done = 0;
+  foreach ($progress as $v) {
+    if ($v) {
+      $done++;
+    }
+  }
+  $pct = (int) round(($done / $total) * 100);
+
+  return [
+    'pct'      => $pct,
+    'total'    => $total,
+    'done'     => $done,
+    'progress' => (object) $progress,
+  ];
+}
+
 add_action('rest_api_init', function () {
-  // === PROGRESS ===
   register_rest_route(BODHI_API_NS, '/progress', [
-    'methods'  => 'GET',
-    'permission_callback' => function () { return is_user_logged_in(); },
-    'callback' => function (WP_REST_Request $req) {
-      $uid = get_current_user_id();
-      $course_id = (int) $req->get_param('course_id');
-      if (!$course_id) {
-        return new WP_Error('bad_request', 'course_id requerido', ['status' => 400]);
-      }
-
-      $key = "bodhi_progress_{$course_id}";
-      $data = get_user_meta($uid, $key, true);
-      return rest_ensure_response(is_array($data) ? $data : []);
-    }
-  ]);
-
-  register_rest_route(BODHI_API_NS, '/progress', [
-    'methods'  => 'POST',
-    'permission_callback' => function () { return is_user_logged_in(); },
-    'callback' => function (WP_REST_Request $req) {
-      $uid = get_current_user_id();
-      $course_id = (int) $req->get_param('course_id');
-      $lesson_id = (int) $req->get_param('lesson_id');
-      $done = filter_var($req->get_param('done'), FILTER_VALIDATE_BOOLEAN, FILTER_NULL_ON_FAILURE);
-      if (!$course_id || !$lesson_id || $done === null) {
-        return new WP_Error('bad_request', 'course_id, lesson_id, done requeridos', ['status' => 400]);
-      }
-
-      $key = "bodhi_progress_{$course_id}";
-      $data = get_user_meta($uid, $key, true);
-      $data = is_array($data) ? $data : [];
-      $data[$lesson_id] = (bool) $done;
-      update_user_meta($uid, $key, $data);
-
-      $total = max(1, (int) $req->get_param('total_lessons'));
-      $done_count = count(array_filter($data));
-      $pct = min(100, round(($done_count / $total) * 100));
-
-      return rest_ensure_response([
-        'course_id'   => $course_id,
-        'progress'    => $data,
-        'done_count'  => $done_count,
-        'pct'         => $pct,
-      ]);
-    }
+    'methods'  => ['GET', 'POST'],
+    'callback' => 'bodhi_progress_handler',
+    'permission_callback' => 'bodhi_require_login',
   ]);
 });
+
+function bodhi_progress_handler(WP_REST_Request $req) {
+  $uid = get_current_user_id();
+  $course_id = (int) $req->get_param('course_id');
+  if ($course_id <= 0) {
+    return new WP_Error('bodhi_bad_req', 'course_id requerido', ['status' => 400]);
+  }
+
+  $meta_key = 'bodhi_progress_' . $course_id;
+
+  if ($req->get_method() === 'POST') {
+    $lesson_id = (int) $req->get_param('lesson_id');
+    if ($lesson_id <= 0) {
+      return new WP_Error('bodhi_bad_req', 'lesson_id requerido', ['status' => 400]);
+    }
+
+    $done = $req->get_param('done');
+    if ($done === null) {
+      $done = true;
+    }
+    $done = filter_var($done, FILTER_VALIDATE_BOOLEAN, FILTER_NULL_ON_FAILURE);
+    if ($done === null) {
+      $done = true;
+    }
+
+    $progress = get_user_meta($uid, $meta_key, true);
+    if (!is_array($progress)) {
+      $progress = [];
+    }
+    $progress[(string) $lesson_id] = (bool) $done;
+    update_user_meta($uid, $meta_key, $progress);
+  }
+
+  $summary = bodhi_progress_summary($course_id, $uid);
+  $summary['course_id'] = $course_id;
+  return rest_ensure_response($summary);
+}
+
+function bodhi_enrollments_get_course_ids($user_id, $page, $per_page, $owned_only = true) {
+  global $wpdb;
+  $table = $wpdb->prefix . 'bodhi_enrollments';
+  static $table_exists = null;
+  if ($table_exists === null) {
+    $table_exists = ($wpdb->get_var($wpdb->prepare('SHOW TABLES LIKE %s', $table)) === $table);
+  }
+  if (!$table_exists) {
+    return [[], 0];
+  }
+
+  $offset = max(0, ($page - 1) * $per_page);
+  $where = ['user_id = %d'];
+  $params = [$user_id];
+  if ($owned_only) {
+    $where[] = "status = 'owned'";
+  }
+  $where_sql = implode(' AND ', $where);
+
+  $total = (int) $wpdb->get_var($wpdb->prepare(
+    "SELECT COUNT(*) FROM {$table} WHERE {$where_sql}",
+    ...$params
+  ));
+
+  $params_ids = array_merge($params, [$per_page, $offset]);
+  $ids = $wpdb->get_col($wpdb->prepare(
+    "SELECT course_id
+     FROM {$table}
+     WHERE {$where_sql}
+     ORDER BY course_id DESC
+     LIMIT %d OFFSET %d",
+    ...$params_ids
+  ));
+
+  $ids = array_map('intval', $ids ?: []);
+  return [$ids, $total];
+}
+
+function bodhi_rest_get_courses(WP_REST_Request $req) {
+  $user_id = get_current_user_id();
+  if (!$user_id) {
+    return new WP_Error('forbidden', 'Auth requerida', ['status' => 401]);
+  }
+
+  $page = max(1, (int) $req->get_param('page'));
+  $per_page = min(50, max(1, (int) $req->get_param('per_page')));
+  $owned = wp_validate_boolean($req->get_param('owned'));
+
+  [$course_ids, $total] = bodhi_enrollments_get_course_ids($user_id, $page, $per_page, $owned !== false);
+
+  $total_pages = $per_page > 0 ? ceil($total / $per_page) : 0;
+  $server = rest_get_server();
+  if ($server) {
+    $server->send_header('X-WP-Total', (int) $total);
+    $server->send_header('X-WP-TotalPages', (int) $total_pages);
+  } else {
+    header('X-WP-Total: ' . (int) $total);
+    header('X-WP-TotalPages: ' . (int) $total_pages);
+  }
+  if (empty($course_ids)) {
+    return rest_ensure_response([]);
+  }
+
+  $post_type = bodhi_get_course_pt();
+  $query = new WP_Query([
+    'post_type'      => $post_type,
+    'post__in'       => $course_ids,
+    'orderby'        => 'post__in',
+    'posts_per_page' => count($course_ids),
+    'no_found_rows'  => true,
+  ]);
+
+  $items = [];
+  foreach ($query->posts as $p) {
+    $items[] = [
+      'id'     => (int) $p->ID,
+      'title'  => get_the_title($p),
+      'slug'   => $p->post_name,
+      'thumb'  => get_the_post_thumbnail_url($p, 'medium') ?: null,
+      'access' => 'owned',
+    ];
+  }
+
+  return rest_ensure_response($items);
+}
+
+function bodhi_outline_from_thrive(WP_REST_Request $req) {
+  $course_id = (int) $req->get_param('course_id');
+  if ($course_id <= 0) {
+    return new WP_Error('bodhi_bad_req', 'course_id requerido', ['status' => 400]);
+  }
+
+  $r = bodhi_fetch_json("tva-public/v1/course/{$course_id}/items");
+  if (empty($r['ok'])) {
+    return new WP_Error(
+      'bodhi_upstream',
+      'Thrive items error',
+      ['status' => 502, 'upstream_code' => $r['code'] ?? 0]
+    );
+  }
+
+  $items = is_array($r['data']) ? $r['data'] : [];
+  $modules_src = isset($items['modules']) && is_array($items['modules']) ? $items['modules'] : [];
+  $lessons_src = isset($items['lessons']) && is_array($items['lessons']) ? $items['lessons'] : [];
+
+  $modules = array_map(function ($m) {
+    $id = $m['id'] ?? ($m['ID'] ?? null);
+    return [
+      'id'      => $id !== null ? (int) $id : null,
+      'title'   => isset($m['post_title']) ? (string) $m['post_title'] : '',
+      'lessons' => [],
+    ];
+  }, $modules_src);
+
+  $by_id = [];
+  foreach ($modules as $idx => $_module) {
+    $module_id = $modules[$idx]['id'];
+    if ($module_id !== null) {
+      $by_id[(string) $module_id] = &$modules[$idx];
+    }
+  }
+  unset($_module);
+
+  foreach ($lessons_src as $lesson) {
+    $lesson_id = $lesson['id'] ?? ($lesson['ID'] ?? null);
+    $module_id = $lesson['post_parent'] ?? null;
+    $entry = [
+      'id'    => $lesson_id !== null ? (int) $lesson_id : null,
+      'title' => isset($lesson['post_title']) ? (string) $lesson['post_title'] : '',
+    ];
+    if ($module_id !== null && isset($by_id[(string) $module_id])) {
+      $by_id[(string) $module_id]['lessons'][] = $entry;
+    }
+  }
+
+  return rest_ensure_response([
+    'deprecated' => true,
+    'course_id'  => $course_id,
+    'modules'    => array_values($modules),
+  ]);
+}
+
+function bodhi_lessons_from_thrive(WP_REST_Request $req) {
+  $course_id = (int) $req->get_param('course_id');
+  if ($course_id <= 0) {
+    return new WP_Error('bodhi_bad_req', 'course_id requerido', ['status' => 400]);
+  }
+
+  $r = bodhi_fetch_json("tva-public/v1/course/{$course_id}/items");
+  if (empty($r['ok'])) {
+    return new WP_Error(
+      'bodhi_upstream',
+      'Thrive items error',
+      ['status' => 502, 'upstream_code' => $r['code'] ?? 0]
+    );
+  }
+
+  $lessons_src = $r['data']['lessons'] ?? [];
+  if (!is_array($lessons_src)) {
+    $lessons_src = [];
+  }
+
+  $lessons = array_map(function ($lesson) {
+    $id = $lesson['id'] ?? ($lesson['ID'] ?? null);
+    $video_url = isset($lesson['video']['source']) ? (string) $lesson['video']['source'] : '';
+    $media = null;
+    if ($video_url !== '') {
+      $parsed = bodhi_parse_vimeo($video_url);
+      if ($parsed) {
+        $media = [
+          'provider' => 'vimeo',
+          'id'       => (string) $parsed['id'],
+          'h'        => $parsed['h'] ?? null,
+        ];
+      }
+    }
+    return [
+      'id'     => $id !== null ? (int) $id : null,
+      'title'  => isset($lesson['post_title']) ? (string) $lesson['post_title'] : '',
+      'blocks' => [],
+      'media'  => $media,
+    ];
+  }, $lessons_src);
+
+  return rest_ensure_response([
+    'deprecated' => true,
+    'course_id'  => $course_id,
+    'items'      => array_values($lessons),
+  ]);
+}
+
+function bodhi_course_detail_normalized(WP_REST_Request $req) {
+  $course_id = (int) $req['id'];
+  if ($course_id <= 0) {
+    return new WP_Error('bad_request', 'ID de curso inválido', ['status' => 400]);
+  }
+
+  $r = bodhi_fetch_json("tva-public/v1/course/{$course_id}/items");
+  if (empty($r['ok'])) {
+    return new WP_Error(
+      'bodhi_upstream',
+      'Thrive items error',
+      ['status' => 502, 'upstream_code' => $r['code'] ?? 0]
+    );
+  }
+
+  $items = is_array($r['data']) ? $r['data'] : [];
+  $modules_src = isset($items['modules']) && is_array($items['modules']) ? $items['modules'] : [];
+  $lessons_src = isset($items['lessons']) && is_array($items['lessons']) ? $items['lessons'] : [];
+
+  $modules = array_map(function ($m) {
+    $id = $m['id'] ?? ($m['ID'] ?? null);
+    return [
+      'id'           => $id !== null ? (int) $id : null,
+      'title'        => isset($m['post_title']) ? (string) $m['post_title'] : '',
+      'order'        => isset($m['order']) ? (int) $m['order'] : 0,
+      'cover_image'  => isset($m['cover_image']) ? (string) $m['cover_image'] : '',
+      'publish_date' => $m['publish_date'] ?? null,
+      'schema'       => (object)[],
+    ];
+  }, $modules_src);
+
+  $lessons = array_map(function ($l) {
+    $id = $l['id'] ?? ($l['ID'] ?? null);
+    $module_id = $l['module_id'] ?? ($l['post_parent'] ?? null);
+    $type = $l['lesson_type'] ?? null;
+    if (!$type && !empty($l['video']['source'])) {
+      $type = 'video';
+    }
+    if (!$type) {
+      $type = 'article';
+    }
+    $video_url = isset($l['video']['source']) ? (string) $l['video']['source'] : '';
+    $media = null;
+    if ($video_url !== '') {
+      $parsed = bodhi_parse_vimeo($video_url);
+      if ($parsed) {
+        $media = [
+          'provider' => 'vimeo',
+          'id'       => (string) $parsed['id'],
+          'h'        => $parsed['h'] ?? null,
+        ];
+      }
+    }
+    return [
+      'id'          => $id !== null ? (int) $id : null,
+      'moduleId'    => $module_id !== null ? (int) $module_id : null,
+      'title'       => isset($l['post_title']) ? (string) $l['post_title'] : '',
+      'type'        => (string) $type,
+      'url'         => $video_url,
+      'order'       => isset($l['order']) ? (int) $l['order'] : 0,
+      'preview_url' => isset($l['preview_url']) ? (string) $l['preview_url'] : '',
+      'media'       => $media,
+    ];
+  }, $lessons_src);
+
+  if (empty($modules) && !empty($lessons)) {
+    $single_id = (int) ($course_id . '001');
+    $modules = [[
+      'id'           => $single_id,
+      'title'        => 'Contenido',
+      'order'        => 0,
+      'cover_image'  => '',
+      'publish_date' => null,
+      'schema'       => (object)[],
+    ]];
+    foreach ($lessons as &$lesson_ref) {
+      if (empty($lesson_ref['moduleId'])) {
+        $lesson_ref['moduleId'] = $single_id;
+      }
+    }
+    unset($lesson_ref);
+  }
+
+  $base = [
+    'id'            => $course_id,
+    'title'         => '',
+    'slug'          => '',
+    'cover'         => '',
+    'summary'       => '',
+    'lessons_count' => count($lessons),
+    'access'        => 'granted',
+  ];
+
+  return rest_ensure_response(array_merge(
+    $base,
+    [
+      'modules' => array_values($modules),
+      'lessons' => array_values($lessons),
+    ]
+  ));
+}
 
 /** ACF local solo si usamos CPT propio "course" */
 add_action('acf/init', function(){
@@ -938,8 +962,11 @@ add_action('acf/init', function(){
 add_action('rest_api_init', function () {
   register_rest_route(BODHI_API_NS, '/thrive-introspect', [
     'methods'  => 'GET',
-    'permission_callback' => '__return_true',
+    'permission_callback' => 'bodhi_require_login',
     'callback' => function (WP_REST_Request $req) {
+      if (!bodhi_is_staging() || !current_user_can('manage_options')) {
+        return new WP_Error('forbidden', 'debug solo en staging/admin', ['status' => 403]);
+      }
       global $wpdb;
       // post types Thrive detectados
       $available = get_post_types([], 'names');
@@ -1070,7 +1097,7 @@ function bodhi_ajax_login() {
 add_action('rest_api_init', function(){
   register_rest_route('bodhi/v1', '/me', [
     'methods'  => 'GET',
-    'permission_callback' => '__return_true',
+    'permission_callback' => 'bodhi_require_login',
     'callback' => function(){
       $u = wp_get_current_user();
       if (!$u || 0 === $u->ID) return ['logged_in'=>false];
