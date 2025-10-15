@@ -10,6 +10,13 @@ if ( ! defined('ABSPATH') ) exit;
 define('BODHI_API_VERSION', '0.2.1');
 define('BODHI_API_NS', 'bodhi/v1');
 
+// --- Bridge REST para la app móvil (carga no intrusiva) ---
+add_action('plugins_loaded', function () {
+  $bridge = __DIR__ . '/inc/rest-bridge.php';
+  if (file_exists($bridge)) { require_once $bridge; } // registra /bm/v1/*
+}, 1);
+// ----------------------------------------------------------
+
 // === Forzar JSON en /bodhi/v1/courses aunque haya wp_die / fatales ===
 add_filter('wp_die_handler', function () {
   return function ($message, $title = '', $args = []) {
