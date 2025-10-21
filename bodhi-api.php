@@ -144,6 +144,46 @@ function bodhi_parse_vimeo($url){
   return null;
 }
 
+// Devuelve un ID entero desde múltiples shapes posibles
+function bodhi_course_id_from($c) {
+  if (is_array($c)) {
+    foreach (['id','ID','course_id','post_id'] as $k) {
+      if (!empty($c[$k])) return intval($c[$k]);
+    }
+    if (!empty($c['post']['ID']))   return intval($c['post']['ID']);
+    if (!empty($c['course']['id'])) return intval($c['course']['id']);
+    if (!empty($c['course']['ID'])) return intval($c['course']['ID']);
+  }
+  return 0;
+}
+
+// Devuelve un título “humano”
+function bodhi_course_title_from($c) {
+  if (is_array($c)) {
+    foreach (['title','name','post_title'] as $k) {
+      if (!empty($c[$k])) return (string)$c[$k];
+    }
+    if (!empty($c['post']['post_title']))  return (string)$c['post']['post_title'];
+    if (!empty($c['course']['title']))     return (string)$c['course']['title'];
+    if (!empty($c['course']['name']))      return (string)$c['course']['name'];
+  }
+  return 'Course';
+}
+
+// “Desempaqueta” respuestas { items: [...] } o { data: { items: [...] } }
+function bodhi_unwrap_items($payload) {
+  if (is_array($payload)) {
+    if (isset($payload['items']) && is_array($payload['items'])) {
+      return $payload['items'];
+    }
+    if (isset($payload['data']['items']) && is_array($payload['data']['items'])) {
+      return $payload['data']['items'];
+    }
+    return $payload;
+  }
+  return [];
+}
+
 // === Helpers mínimos ===
 function bodhi_fetch_json($path, $ttl = 120) {
   static $cache = [];
@@ -209,15 +249,13 @@ function bodhi_tva_get_user_courses_filtered($page = 1, $per_page = 20, $owned =
     'dropped_access'      => 0,
     'errors'              => [],
   ];
+  $GLOBALS['__bodhi_diag'] = &$diag;
 
   // A) /tva/v2/courses (status=published) + unwrap shape {items:[]}
-  $tvacourses = bodhi_tva_fetch_courses_fallback($page, $per_page);
+  $tvacourses = bodhi_unwrap_items(bodhi_tva_fetch_courses_fallback($page, $per_page));
   if (is_wp_error($tvacourses)) {
     $diag['errors'][] = $tvacourses->get_error_message();
     return $tvacourses;
-  }
-  if (!is_array($tvacourses) && is_array($tvacourses['items'] ?? null)) {
-    $tvacourses = $tvacourses['items'];
   }
   if (!is_array($tvacourses)) {
     $tvacourses = [];
@@ -225,14 +263,7 @@ function bodhi_tva_get_user_courses_filtered($page = 1, $per_page = 20, $owned =
   $diag['tvacount'] = count($tvacourses);
 
   foreach ($tvacourses as $course) {
-    if (is_object($course)) {
-      $course = (array) $course;
-    }
-    if (!isset($course['id']) && !isset($course['ID'])) {
-      $diag['dropped_no_id']++;
-      continue;
-    }
-    $cid = (int) ($course['id'] ?? $course['ID']);
+    $cid = bodhi_course_id_from($course);
     if ($cid <= 0) {
       $diag['dropped_no_id']++;
       continue;
@@ -259,17 +290,9 @@ function bodhi_tva_get_user_courses_filtered($page = 1, $per_page = 20, $owned =
 
     $mapped = bodhi_map_course($course);
     if (empty($mapped) || empty($mapped['id'])) {
-      $title_src = $course['title'] ?? $course['name'] ?? $course['post_title'] ?? '';
-      if (is_array($title_src)) {
-        $title_src = $title_src['rendered'] ?? reset($title_src) ?? '';
-      }
-      $title_fallback = wp_strip_all_tags((string) $title_src);
-      if ($title_fallback === '') {
-        $title_fallback = 'Curso #' . $cid;
-      }
       $mapped = [
         'id'    => $cid,
-        'title' => $title_fallback,
+        'title' => bodhi_course_title_from($course),
       ];
     }
     $mapped['id'] = $cid;
@@ -289,10 +312,7 @@ function bodhi_tva_get_user_courses_filtered($page = 1, $per_page = 20, $owned =
 
   // B) Productos → courses (solo “union”)
   if ($mode === 'union') {
-    $products = bodhi_tva_fetch_user_products($uid);
-    if (!is_array($products) && is_array($products['items'] ?? null)) {
-      $products = $products['items'];
-    }
+    $products = bodhi_unwrap_items(bodhi_tva_fetch_user_products($uid));
     if (!is_array($products)) {
       $diag['errors'][] = 'products_empty_or_error';
       $products = [];
@@ -308,19 +328,13 @@ function bodhi_tva_get_user_courses_filtered($page = 1, $per_page = 20, $owned =
         continue;
       }
 
-      $pcourses = bodhi_tva_fetch_product_courses($pid);
-      if (!is_array($pcourses) && is_array($pcourses['items'] ?? null)) {
-        $pcourses = $pcourses['items'];
-      }
+      $pcourses = bodhi_unwrap_items(bodhi_tva_fetch_product_courses($pid));
       if (!is_array($pcourses)) {
         continue;
       }
 
       foreach ($pcourses as $pc) {
-        if (is_object($pc)) {
-          $pc = (array) $pc;
-        }
-        $cid = (int) ($pc['id'] ?? $pc['ID'] ?? 0);
+        $cid = bodhi_course_id_from($pc);
         if ($cid <= 0) {
           $diag['dropped_no_id']++;
           continue;
@@ -337,17 +351,9 @@ function bodhi_tva_get_user_courses_filtered($page = 1, $per_page = 20, $owned =
 
         $mapped = bodhi_map_course($pc);
         if (empty($mapped) || empty($mapped['id'])) {
-          $title_src = $pc['title'] ?? $pc['name'] ?? $pc['post_title'] ?? '';
-          if (is_array($title_src)) {
-            $title_src = $title_src['rendered'] ?? reset($title_src) ?? '';
-          }
-          $title_fallback = wp_strip_all_tags((string) $title_src);
-          if ($title_fallback === '') {
-            $title_fallback = 'Curso #' . $cid;
-          }
           $mapped = [
             'id'    => $cid,
-            'title' => $title_fallback,
+            'title' => bodhi_course_title_from($pc),
           ];
         }
         $mapped['id'] = $cid;
@@ -458,19 +464,49 @@ function bodhi_tva_fetch_courses_fallback($page = 1, $per_page = 20) {
 }
 
 function bodhi_tva_fetch_user_products($uid) {
-  $req = new WP_REST_Request('GET', '/tva/v1/customer/' . (int) $uid . '/products');
-  $req->set_param('context', 'edit');
-
-  $res = rest_do_request($req);
-  return $res instanceof WP_REST_Response ? ($res->get_data() ?: []) : [];
+  $uid = intval($uid);
+  foreach ([
+    ["/tva/v1/customer/$uid/products",  'view'],
+    ["/tva/v1/customer/$uid/products",  'edit'],
+    ["/tva/v1/customers/$uid/products", 'view'],
+    ["/tva/v1/customers/$uid/products", 'edit'],
+  ] as $opt) {
+    [$route, $ctx] = $opt;
+    $req = new WP_REST_Request('GET', $route);
+    $req->set_param('context', $ctx);
+    $res = rest_do_request($req);
+    if ($res instanceof WP_REST_Response) {
+      $data = $res->get_data();
+      if ($data) {
+        return $data;
+      }
+    } elseif (is_wp_error($res) && isset($GLOBALS['__bodhi_diag'])) {
+      $GLOBALS['__bodhi_diag']['errors'][] = 'products:' . $res->get_error_code();
+    }
+  }
+  return [];
 }
 
 function bodhi_tva_fetch_product_courses($pid) {
-  $req = new WP_REST_Request('GET', '/tva/v1/products/' . (int) $pid . '/courses');
-  $req->set_param('context', 'edit');
-
-  $res = rest_do_request($req);
-  return $res instanceof WP_REST_Response ? ($res->get_data() ?: []) : [];
+  $pid = intval($pid);
+  foreach ([
+    ["/tva/v1/products/$pid/courses", 'view'],
+    ["/tva/v1/products/$pid/courses", 'edit'],
+  ] as $opt) {
+    [$route, $ctx] = $opt;
+    $req = new WP_REST_Request('GET', $route);
+    $req->set_param('context', $ctx);
+    $res = rest_do_request($req);
+    if ($res instanceof WP_REST_Response) {
+      $data = $res->get_data();
+      if ($data) {
+        return $data;
+      }
+    } elseif (is_wp_error($res) && isset($GLOBALS['__bodhi_diag'])) {
+      $GLOBALS['__bodhi_diag']['errors'][] = 'pcourses:' . $res->get_error_code();
+    }
+  }
+  return [];
 }
 
 function bodhi_create_enrollments_table() {
