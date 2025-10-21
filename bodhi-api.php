@@ -173,71 +173,304 @@ function bodhi_require_login() {
   return is_user_logged_in();
 }
 
-function bodhi_tva_get_user_courses_filtered($page = 1, $per_page = 12, $owned_only = true) {
+/**
+ * Recolecta cursos visibles para el usuario actual.
+ * - strict: solo cursos con acceso explícito en la respuesta principal de Thrive.
+ * - union : strict + cursos concedidos vía productos asignados al usuario.
+ *
+ * @param int        $page
+ * @param int        $per_page
+ * @param bool       $owned
+ * @param string     $mode
+ * @param array|null $diag  Métricas de diagnóstico (debug union/strict).
+ */
+function bodhi_tva_get_user_courses_filtered($page = 1, $per_page = 20, $owned = true, $mode = 'strict', &$diag = null) {
+  $uid = get_current_user_id();
+  if (!$uid) return [];
+
   $page = max(1, (int) $page);
-  $per_page = min(50, max(1, (int) $per_page));
+  $per_page = max(1, min(50, (int) $per_page));
+  $mode = in_array($mode, ['strict', 'union'], true) ? $mode : 'strict';
 
-  $req = new WP_REST_Request('GET', '/tva/v2/courses');
-  $req->set_param('status', 'published');
-  $req->set_param('page', $page);
-  $req->set_param('per_page', $per_page);
+  $out  = [];
+  $seen = [];
 
-  $res = rest_do_request($req);
-  if (is_wp_error($res)) {
-    return $res;
+  $diag = [
+    'uid'                 => $uid,
+    'page'                => $page,
+    'per'                 => $per_page,
+    'owned'               => $owned,
+    'mode'                => $mode,
+    'tvacount'            => 0,              // cursos recibidos (tras unwrap)
+    'kept_strict'         => 0,
+    'products'            => 0,              // productos recibidos (tras unwrap)
+    'added_from_products' => 0,
+    'dropped_no_id'       => 0,
+    'dropped_access'      => 0,
+    'errors'              => [],
+  ];
+
+  // A) /tva/v2/courses (status=published) + unwrap shape {items:[]}
+  $tvacourses = bodhi_tva_fetch_courses_fallback($page, $per_page);
+  if (is_wp_error($tvacourses)) {
+    $diag['errors'][] = $tvacourses->get_error_message();
+    return $tvacourses;
   }
-  if (!($res instanceof WP_REST_Response)) {
-    return new WP_Error('bodhi_tva_bad_response', 'Respuesta inesperada de Thrive Apprentice');
+  if (!is_array($tvacourses) && is_array($tvacourses['items'] ?? null)) {
+    $tvacourses = $tvacourses['items'];
   }
+  if (!is_array($tvacourses)) {
+    $tvacourses = [];
+  }
+  $diag['tvacount'] = count($tvacourses);
 
-  $data    = $res->get_data();
-  $headers = $res->get_headers();
-
-  $out = [];
-  foreach ((array) $data as $c) {
-    $has_access = false;
-    if (isset($c['has_access'])) {
-      $has_access = (bool) $c['has_access'];
-    } elseif (isset($c['access'])) {
-      $has_access = in_array((string) $c['access'], ['owned', 'member', 'free'], true);
+  foreach ($tvacourses as $course) {
+    if (is_object($course)) {
+      $course = (array) $course;
     }
-
-    if ($owned_only && !$has_access) {
+    if (!isset($course['id']) && !isset($course['ID'])) {
+      $diag['dropped_no_id']++;
+      continue;
+    }
+    $cid = (int) ($course['id'] ?? $course['ID']);
+    if ($cid <= 0) {
+      $diag['dropped_no_id']++;
       continue;
     }
 
-    $title = '';
-    if (isset($c['title'])) {
-      if (is_array($c['title']) && isset($c['title']['rendered'])) {
-        $title = wp_strip_all_tags((string) $c['title']['rendered']);
-      } else {
-        $title = wp_strip_all_tags((string) $c['title']);
+    $has_access = null;
+    if (isset($course['has_access'])) {
+      $has_access = (bool) $course['has_access'];
+    } elseif (isset($course['access'])) {
+      $has_access = in_array((string) $course['access'], ['owned', 'member', 'free'], true);
+    }
+    $access_code = $course['access'] ?? null;
+
+    if ($owned) {
+      if ($has_access === false) {
+        $diag['dropped_access']++;
+        continue;
+      }
+      if ($access_code !== null && !in_array((string) $access_code, ['owned', 'member', 'free'], true)) {
+        $diag['dropped_access']++;
+        continue;
       }
     }
 
-    $thumb = $c['cover']['url'] ?? ($c['featured_image'] ?? null);
-    $course_id = (int) ($c['id'] ?? $c['ID'] ?? 0);
-    if ($course_id <= 0) {
-      continue;
+    $mapped = bodhi_map_course($course);
+    if (empty($mapped) || empty($mapped['id'])) {
+      $title_src = $course['title'] ?? $course['name'] ?? $course['post_title'] ?? '';
+      if (is_array($title_src)) {
+        $title_src = $title_src['rendered'] ?? reset($title_src) ?? '';
+      }
+      $title_fallback = wp_strip_all_tags((string) $title_src);
+      if ($title_fallback === '') {
+        $title_fallback = 'Curso #' . $cid;
+      }
+      $mapped = [
+        'id'    => $cid,
+        'title' => $title_fallback,
+      ];
     }
+    $mapped['id'] = $cid;
 
-    $out[] = [
-      'id'     => $course_id,
-      'title'  => $title !== '' ? $title : ('Curso #' . $course_id),
-      'slug'   => (string) ($c['slug'] ?? ''),
-      'thumb'  => $thumb ?: null,
-      'access' => (string) ($c['access'] ?? ($has_access ? 'owned' : 'locked')),
-    ];
+    if ($has_access !== null && !isset($mapped['has_access'])) {
+      $mapped['has_access'] = $has_access;
+    }
+    if (!isset($mapped['access']) && $access_code !== null) {
+      $mapped['access'] = (string) $access_code;
+    }
+    $mapped['access_reason'] = 'thrive_flag';
+
+    $out[] = $mapped;
+    $seen[$mapped['id']] = true;
+    $diag['kept_strict']++;
   }
 
-  $resp = new WP_REST_Response($out, 200);
-  if (isset($headers['X-WP-Total'])) {
-    $resp->header('X-WP-Total', $headers['X-WP-Total']);
+  // B) Productos → courses (solo “union”)
+  if ($mode === 'union') {
+    $products = bodhi_tva_fetch_user_products($uid);
+    if (!is_array($products) && is_array($products['items'] ?? null)) {
+      $products = $products['items'];
+    }
+    if (!is_array($products)) {
+      $diag['errors'][] = 'products_empty_or_error';
+      $products = [];
+    }
+    $diag['products'] = count($products);
+
+    foreach ($products as $product) {
+      if (is_object($product)) {
+        $product = (array) $product;
+      }
+      $pid = (int) ($product['id'] ?? $product['ID'] ?? 0);
+      if ($pid <= 0) {
+        continue;
+      }
+
+      $pcourses = bodhi_tva_fetch_product_courses($pid);
+      if (!is_array($pcourses) && is_array($pcourses['items'] ?? null)) {
+        $pcourses = $pcourses['items'];
+      }
+      if (!is_array($pcourses)) {
+        continue;
+      }
+
+      foreach ($pcourses as $pc) {
+        if (is_object($pc)) {
+          $pc = (array) $pc;
+        }
+        $cid = (int) ($pc['id'] ?? $pc['ID'] ?? 0);
+        if ($cid <= 0) {
+          $diag['dropped_no_id']++;
+          continue;
+        }
+        if (isset($seen[$cid])) {
+          continue;
+        }
+        if (!empty($pc['status']) && $pc['status'] !== 'publish') {
+          continue;
+        }
+        if (!empty($pc['post_status']) && $pc['post_status'] !== 'publish') {
+          continue;
+        }
+
+        $mapped = bodhi_map_course($pc);
+        if (empty($mapped) || empty($mapped['id'])) {
+          $title_src = $pc['title'] ?? $pc['name'] ?? $pc['post_title'] ?? '';
+          if (is_array($title_src)) {
+            $title_src = $title_src['rendered'] ?? reset($title_src) ?? '';
+          }
+          $title_fallback = wp_strip_all_tags((string) $title_src);
+          if ($title_fallback === '') {
+            $title_fallback = 'Curso #' . $cid;
+          }
+          $mapped = [
+            'id'    => $cid,
+            'title' => $title_fallback,
+          ];
+        }
+        $mapped['id'] = $cid;
+        $mapped['has_access'] = $mapped['has_access'] ?? true;
+        $mapped['access'] = $mapped['access'] ?? 'owned_by_product';
+        $mapped['access_reason'] = 'product_grant';
+
+        $out[] = $mapped;
+        $seen[$cid] = true;
+        $diag['added_from_products']++;
+      }
+    }
   }
-  if (isset($headers['X-WP-TotalPages'])) {
-    $resp->header('X-WP-TotalPages', $headers['X-WP-TotalPages']);
+
+  return $out;
+}
+
+/**
+ * Normaliza el payload de Thrive Apprentice a la estructura usada por la app.
+ */
+function bodhi_map_course($course) {
+  if ($course instanceof WP_REST_Response) {
+    $course = $course->get_data();
   }
-  return $resp;
+  if (is_object($course)) {
+    $course = (array) $course;
+  }
+  if (!is_array($course)) {
+    return [];
+  }
+
+  $course_id = (int) ($course['id'] ?? $course['ID'] ?? 0);
+  if ($course_id <= 0) {
+    return [];
+  }
+
+  $title = '';
+  if (isset($course['title'])) {
+    if (is_array($course['title']) && isset($course['title']['rendered'])) {
+      $title = wp_strip_all_tags((string) $course['title']['rendered']);
+    } else {
+      $title = wp_strip_all_tags((string) $course['title']);
+    }
+  } elseif (isset($course['post_title'])) {
+    $title = wp_strip_all_tags((string) $course['post_title']);
+  }
+  if ($title === '') {
+    $title = 'Curso #' . $course_id;
+  }
+
+  $thumb = null;
+  if (isset($course['cover']['url'])) {
+    $thumb = $course['cover']['url'];
+  } elseif (isset($course['featured_image'])) {
+    $thumb = $course['featured_image'];
+  } elseif (isset($course['thumbnail'])) {
+    $thumb = $course['thumbnail'];
+  } elseif (isset($course['featured_image_url'])) {
+    $thumb = $course['featured_image_url'];
+  }
+  if (is_array($thumb)) {
+    $thumb = $thumb['url'] ?? null;
+  }
+
+  $has_access = null;
+  if (isset($course['has_access'])) {
+    $has_access = (bool) $course['has_access'];
+  } elseif (isset($course['access'])) {
+    $has_access = in_array((string) $course['access'], ['owned', 'member', 'free'], true);
+  }
+
+  $access = (string) ($course['access'] ?? ($has_access ? 'owned' : 'locked'));
+
+  $out = [
+    'id'     => $course_id,
+    'title'  => $title,
+    'slug'   => isset($course['slug']) ? (string) $course['slug'] : (isset($course['post_name']) ? (string) $course['post_name'] : ''),
+    'thumb'  => $thumb ?: null,
+    'access' => $access,
+  ];
+
+  if ($has_access !== null) {
+    $out['has_access'] = $has_access;
+  }
+  if (isset($course['status'])) {
+    $out['status'] = (string) $course['status'];
+  } elseif (isset($course['post_status'])) {
+    $out['status'] = (string) $course['post_status'];
+  }
+  if (isset($course['permalink'])) {
+    $out['permalink'] = (string) $course['permalink'];
+  }
+
+  return $out;
+}
+
+/**
+ * Fallback local si no existiera bodhi_tva_fetch_courses().
+ */
+function bodhi_tva_fetch_courses_fallback($page = 1, $per_page = 20) {
+  $req = new WP_REST_Request('GET', '/tva/v2/courses');
+  $req->set_param('status', 'published');
+  $req->set_param('page', max(1, (int) $page));
+  $req->set_param('per_page', max(1, min(50, (int) $per_page)));
+
+  $res = rest_do_request($req);
+  return $res instanceof WP_REST_Response ? ($res->get_data() ?: []) : [];
+}
+
+function bodhi_tva_fetch_user_products($uid) {
+  $req = new WP_REST_Request('GET', '/tva/v1/customer/' . (int) $uid . '/products');
+  $req->set_param('context', 'edit');
+
+  $res = rest_do_request($req);
+  return $res instanceof WP_REST_Response ? ($res->get_data() ?: []) : [];
+}
+
+function bodhi_tva_fetch_product_courses($pid) {
+  $req = new WP_REST_Request('GET', '/tva/v1/products/' . (int) $pid . '/courses');
+  $req->set_param('context', 'edit');
+
+  $res = rest_do_request($req);
+  return $res instanceof WP_REST_Response ? ($res->get_data() ?: []) : [];
 }
 
 function bodhi_create_enrollments_table() {
@@ -454,13 +687,15 @@ add_action('rest_api_init', function () {
   ]);
 
   register_rest_route('bodhi/v1', '/courses', [
-    'methods'  => 'GET',
+    'methods'  => WP_REST_Server::READABLE,
     'callback' => 'bodhi_rest_get_courses',
-    'permission_callback' => 'bodhi_require_login',
+    'permission_callback' => function(){ return is_user_logged_in(); },
     'args' => [
-      'owned' => ['type' => 'boolean', 'default' => true],
       'page' => ['type' => 'integer', 'default' => 1, 'minimum' => 1],
-      'per_page' => ['type' => 'integer', 'default' => 12, 'minimum' => 1, 'maximum' => 50],
+      'per_page' => ['type' => 'integer', 'default' => 20, 'minimum' => 1, 'maximum' => 50],
+      'owned' => ['type' => 'boolean', 'default' => true],
+      'mode' => ['type' => 'string', 'enum' => ['strict','union'], 'default' => 'strict'],
+      'debug' => ['type' => 'boolean', 'default' => false],
     ],
   ]);
 
@@ -756,26 +991,50 @@ function bodhi_enrollments_get_course_ids($user_id, $page, $per_page, $owned_onl
 }
 
 function bodhi_rest_get_courses(WP_REST_Request $req) {
-  if (!is_user_logged_in()) {
-    return new WP_Error('forbidden', 'Auth requerida', ['status' => 401]);
+  $uid = get_current_user_id();
+  if (!$uid) {
+    return new WP_Error('bodhi_auth', 'No autenticado', ['status' => 401]);
   }
 
-  $page = max(1, (int) ($req->get_param('page') ?: 1));
-  $per_page = min(50, max(1, (int) ($req->get_param('per_page') ?: 12)));
+  $page     = max(1, (int) ($req->get_param('page') ?: 1));
+  $per_page = max(1, min(50, (int) ($req->get_param('per_page') ?: 20)));
 
-  $resp = bodhi_tva_get_user_courses_filtered($page, $per_page);
-  if ($resp instanceof WP_REST_Response) {
-    $headers = $resp->get_headers();
-    $data = $resp->get_data();
-    if (empty($headers['X-WP-Total'])) {
-      $resp->header('X-WP-Total', (string) count($data));
-    }
-    if (empty($headers['X-WP-TotalPages'])) {
-      $resp->header('X-WP-TotalPages', '1');
+  // si true => "solo con acceso" (comportamiento histórico)
+  $owned = $req->get_param('owned');
+  $owned = is_null($owned) ? true : (bool) filter_var($owned, FILTER_VALIDATE_BOOLEAN);
+
+  // "strict" = solo has_access (histórico), "union" = has_access + productos->courses
+  $mode = $req->get_param('mode');
+  if (!in_array($mode, ['strict','union'], true)) {
+    $mode = 'strict';
+  }
+
+  $debug = (bool) filter_var($req->get_param('debug'), FILTER_VALIDATE_BOOLEAN);
+
+  $cache_key = "bodhi:courses:v3:uid={$uid}:m={$mode}:o=" . ($owned ? '1' : '0') . ":p={$page}:n={$per_page}";
+  if (!$debug) {
+    $cached = wp_cache_get($cache_key, 'bodhi');
+    if ($cached !== false) {
+      return $cached;
     }
   }
 
-  return $resp;
+  $diag = null;
+  $items = bodhi_tva_get_user_courses_filtered($page, $per_page, $owned, $mode, $diag);
+
+  if (is_wp_error($items)) {
+    if ($debug && $diag !== null && is_array($diag)) {
+      $items->add_data(['__debug' => $diag]);
+    }
+    return $items;
+  }
+
+  if ($debug) {
+    return ['__debug' => $diag, 'items' => $items];
+  }
+
+  wp_cache_set($cache_key, $items, 'bodhi', 180);
+  return $items;
 }
 
 function bodhi_outline_from_thrive(WP_REST_Request $req) {
