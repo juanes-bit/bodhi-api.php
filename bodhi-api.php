@@ -357,8 +357,8 @@ function bodhi_tva_get_user_courses_filtered($page = 1, $per_page = 20, $owned =
           ];
         }
         $mapped['id'] = $cid;
-        $mapped['has_access'] = $mapped['has_access'] ?? true;
-        $mapped['access'] = $mapped['access'] ?? 'owned_by_product';
+        $mapped['has_access'] = true;
+        $mapped['access'] = 'owned_by_product';
         $mapped['access_reason'] = 'product_grant';
 
         $out[] = $mapped;
