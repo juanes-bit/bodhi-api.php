@@ -146,14 +146,19 @@ function bodhi_parse_vimeo($url){
 
 // Devuelve un ID entero desde múltiples shapes posibles
 function bodhi_course_id_from($c) {
-  if (is_array($c)) {
-    foreach (['id','ID','course_id','post_id'] as $k) {
-      if (!empty($c[$k])) return intval($c[$k]);
-    }
-    if (!empty($c['post']['ID']))   return intval($c['post']['ID']);
-    if (!empty($c['course']['id'])) return intval($c['course']['id']);
-    if (!empty($c['course']['ID'])) return intval($c['course']['ID']);
+  if (is_numeric($c)) {
+    return intval($c);
   }
+  if (!is_array($c)) {
+    return 0;
+  }
+  foreach (['id','ID','course_id','post_id'] as $k) {
+    if (isset($c[$k]) && intval($c[$k]) > 0) {
+      return intval($c[$k]);
+    }
+  }
+  if (isset($c['course']['id'])) return intval($c['course']['id']);
+  if (isset($c['post']['ID']))   return intval($c['post']['ID']);
   return 0;
 }
 
@@ -163,8 +168,8 @@ function bodhi_course_title_from($c) {
     foreach (['title','name','post_title'] as $k) {
       if (!empty($c[$k])) return (string)$c[$k];
     }
-    if (!empty($c['post']['post_title']))  return (string)$c['post']['post_title'];
     if (!empty($c['course']['title']))     return (string)$c['course']['title'];
+    if (!empty($c['post']['post_title']))  return (string)$c['post']['post_title'];
     if (!empty($c['course']['name']))      return (string)$c['course']['name'];
   }
   return 'Course';
@@ -172,16 +177,23 @@ function bodhi_course_title_from($c) {
 
 // “Desempaqueta” respuestas { items: [...] } o { data: { items: [...] } }
 function bodhi_unwrap_items($payload) {
-  if (is_array($payload)) {
-    if (isset($payload['items']) && is_array($payload['items'])) {
-      return $payload['items'];
-    }
-    if (isset($payload['data']['items']) && is_array($payload['data']['items'])) {
-      return $payload['data']['items'];
-    }
-    return $payload;
+  if (is_wp_error($payload)) {
+    return [];
   }
-  return [];
+  if (is_array($payload) && isset($payload['body'])) {
+    $decoded = json_decode($payload['body'], true);
+  } elseif (is_string($payload)) {
+    $decoded = json_decode($payload, true);
+  } else {
+    $decoded = $payload;
+  }
+  if (is_array($decoded) && isset($decoded['items']) && is_array($decoded['items'])) {
+    return $decoded['items'];
+  }
+  if (is_array($decoded) && isset($decoded['data']['items']) && is_array($decoded['data']['items'])) {
+    return $decoded['data']['items'];
+  }
+  return is_array($decoded) ? $decoded : [];
 }
 
 // === Helpers mínimos ===
