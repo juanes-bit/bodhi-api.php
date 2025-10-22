@@ -329,7 +329,7 @@ function bodhi_tva_get_user_courses_filtered($page = 1, $per_page = 20, $owned =
       $diag['errors'][] = 'products_empty_or_error';
       $products = [];
     }
-    $diag['products'] = count($products);
+    $diag['products'] = is_countable($products) ? count($products) : 0;
 
     foreach ($products as $product) {
       if (is_object($product)) {
@@ -340,10 +340,16 @@ function bodhi_tva_get_user_courses_filtered($page = 1, $per_page = 20, $owned =
         continue;
       }
 
-      $pcourses = bodhi_unwrap_items(bodhi_tva_fetch_product_courses($pid));
-      if (!is_array($pcourses)) {
+      $pc_resp  = wp_remote_get(home_url("/wp-json/tva/v1/products/$pid/courses?context=edit&per_page=100"));
+      if (is_wp_error($pc_resp)) {
+        $diag['errors'][] = 'pcourses:' . $pc_resp->get_error_code();
         continue;
       }
+      $pcourses = bodhi_unwrap_items($pc_resp);
+      if (!is_array($pcourses)) {
+        $pcourses = [];
+      }
+      $pcourses = array_values($pcourses);
 
       foreach ($pcourses as $pc) {
         $cid = bodhi_course_id_from($pc);
@@ -354,34 +360,21 @@ function bodhi_tva_get_user_courses_filtered($page = 1, $per_page = 20, $owned =
         if (isset($seen[$cid])) {
           continue;
         }
-        if (!empty($pc['status']) && $pc['status'] !== 'publish') {
-          continue;
-        }
-        if (!empty($pc['post_status']) && $pc['post_status'] !== 'publish') {
-          continue;
+        $title = bodhi_course_title_from($pc);
+        $thumb = is_array($pc) ? ($pc['thumb'] ?? $pc['thumbnail'] ?? null) : null;
+        if (is_array($thumb)) {
+          $thumb = $thumb['url'] ?? null;
         }
 
-        $mapped = bodhi_map_course($pc);
-        if (empty($mapped) || empty($mapped['id'])) {
-          $mapped = [
-            'id'    => $cid,
-            'title' => bodhi_course_title_from($pc),
-          ];
-        }
-        $mapped['id'] = $cid;
-        $mapped['title'] = $mapped['title'] ?? bodhi_course_title_from($pc);
-        $mapped['slug'] = $mapped['slug'] ?? ($pc['slug'] ?? ($pc['post_name'] ?? ($pc['course']['slug'] ?? null)));
-        $thumb_guess = $mapped['thumb'] ?? ($pc['thumb'] ?? $pc['thumbnail'] ?? $pc['featured_image'] ?? $pc['featured_image_url'] ?? null);
-        if (is_array($thumb_guess)) {
-          $thumb_guess = $thumb_guess['url'] ?? null;
-        }
-        if ($thumb_guess) {
-          $mapped['thumb'] = $thumb_guess;
-        }
-        $mapped['status'] = $mapped['status'] ?? ($pc['status'] ?? ($pc['post_status'] ?? 'publish'));
-        $mapped['has_access'] = true;
-        $mapped['access'] = 'owned_by_product';
-        $mapped['access_reason'] = 'product_grant';
+        $mapped = [
+          'id'            => $cid,
+          'title'         => $title,
+          'thumb'         => $thumb,
+          'status'        => 'publish',
+          'has_access'    => true,
+          'access'        => 'owned_by_product',
+          'access_reason' => 'product_grant',
+        ];
 
         $out[] = $mapped;
         $seen[$cid] = true;
