@@ -357,6 +357,16 @@ function bodhi_tva_get_user_courses_filtered($page = 1, $per_page = 20, $owned =
           ];
         }
         $mapped['id'] = $cid;
+        $mapped['title'] = $mapped['title'] ?? bodhi_course_title_from($pc);
+        $mapped['slug'] = $mapped['slug'] ?? ($pc['slug'] ?? ($pc['post_name'] ?? ($pc['course']['slug'] ?? null)));
+        $thumb_guess = $mapped['thumb'] ?? ($pc['thumb'] ?? $pc['thumbnail'] ?? $pc['featured_image'] ?? $pc['featured_image_url'] ?? null);
+        if (is_array($thumb_guess)) {
+          $thumb_guess = $thumb_guess['url'] ?? null;
+        }
+        if ($thumb_guess) {
+          $mapped['thumb'] = $thumb_guess;
+        }
+        $mapped['status'] = $mapped['status'] ?? ($pc['status'] ?? ($pc['post_status'] ?? 'publish'));
         $mapped['has_access'] = true;
         $mapped['access'] = 'owned_by_product';
         $mapped['access_reason'] = 'product_grant';
