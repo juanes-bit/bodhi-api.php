@@ -349,7 +349,14 @@ function bodhi_tva_get_user_courses_filtered($page = 1, $per_page = 20, $owned =
       if (!is_array($pcourses)) {
         $pcourses = [];
       }
-      $pcourses = array_values($pcourses);
+  $pcourses = array_values($pcourses);
+      if (!empty($pcourses)) {
+        $sample = [];
+        foreach (array_slice($pcourses, 0, 3) as $x) {
+          $sample[] = is_array($x) ? array_keys($x) : gettype($x);
+        }
+        $diag['product_course_sample_keys'] = $sample;
+      }
 
       foreach ($pcourses as $pc) {
         $cid = bodhi_course_id_from($pc);
