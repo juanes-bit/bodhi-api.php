@@ -500,8 +500,8 @@ function bodhi_tva_fetch_user_products($uid) {
 function bodhi_tva_fetch_product_courses($pid) {
   $pid = intval($pid);
   foreach ([
-    ["/tva/v1/products/$pid/courses", 'view'],
     ["/tva/v1/products/$pid/courses", 'edit'],
+    ["/tva/v1/products/$pid/courses", 'view'],
   ] as $opt) {
     [$route, $ctx] = $opt;
     $req = new WP_REST_Request('GET', $route);
