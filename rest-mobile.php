@@ -1,82 +1,97 @@
 <?php
-/**
- * Rutas REST para la app móvil (cookie-only) y proxy interno seguro.
- */
+// Archivo: rest-mobile.php
 if (!defined('ABSPATH')) { exit; }
 
 add_action('rest_api_init', function () {
+  $namespace = 'bodhi-mobile/v1';
 
-  register_rest_route('bodhi/v1', '/nonce', [
+  register_rest_route($namespace, '/nonce', [
     'methods'  => 'GET',
     'permission_callback' => function () { return is_user_logged_in(); },
-    'callback' => function ($req) {
-      return rest_ensure_response(['nonce' => wp_create_nonce('wp_rest')]);
+    'callback' => function () {
+      return ['nonce' => wp_create_nonce('wp_rest')];
     },
   ]);
 
-  register_rest_route('bodhi/v1', '/my-courses', [
+  register_rest_route($namespace, '/my-courses', [
     'methods'  => 'GET',
     'permission_callback' => function () { return is_user_logged_in(); },
-    'callback' => function ($req) {
+    'callback' => function () {
+      $req = new WP_REST_Request('GET', '/bodhi/v1/courses');
+      $req->set_param('mode', 'union');
+      $req->set_param('per_page', 50);
 
-      if (!class_exists('WP_REST_Request')) {
-        require_once ABSPATH . 'wp-includes/class-wp-rest-request.php';
-      }
-      $inner = new WP_REST_Request('GET', '/bodhi/v1/courses');
-      $inner->set_param('mode', 'union');
-
-      $resp = rest_do_request($inner);
+      $resp = rest_do_request($req);
       if (is_wp_error($resp)) {
         return $resp;
       }
-      if (!$resp instanceof WP_REST_Response) {
-        return new WP_Error('bodhi_mobile_proxy', 'Respuesta inesperada en proxy de cursos', ['status' => 500]);
+
+      $data = $resp instanceof WP_REST_Response ? $resp->get_data() : $resp;
+
+      $source = [];
+      if (is_array($data)) {
+        if (isset($data['items']) && is_array($data['items'])) {
+          $source = $data['items'];
+        } else {
+          $source = $data;
+        }
       }
 
-      $data = $resp->get_data();
-      $raw = is_array($data) ? ($data['items'] ?? $data) : [];
-      $items = array_map(function ($x) {
-        if (!is_array($x)) {
-          return [
-            'id'      => 0,
-            'title'   => '',
-            'image'   => null,
-            'percent' => 0,
-            'access'  => 'locked',
-            'isOwned' => false,
-            'excerpt' => '',
-            'video'   => null,
-          ];
+      $items = [];
+      foreach ($source as $entry) {
+        if (!is_array($entry)) {
+          continue;
         }
 
-        $access = isset($x['access']) ? (string) $x['access'] : (isset($x['access_status']) ? (string) $x['access_status'] : '');
-        $owned = !empty($x['is_owned'])
-          || !empty($x['isOwned'])
-          || in_array($access, ['granted', 'owned', 'enrolled', 'allowed', 'member', 'free', 'owned_by_product'], true);
+        $course = isset($entry['course']) && is_array($entry['course']) ? $entry['course'] : [];
 
-        return [
-          'id'      => isset($x['id']) ? intval($x['id']) : 0,
-          'title'   => isset($x['title']) ? (string) $x['title'] : '',
-          'image'   => isset($x['image']) ? $x['image'] : (isset($x['thumbnail']) ? $x['thumbnail'] : (isset($x['thumb']) ? $x['thumb'] : null)),
-          'percent' => isset($x['percent']) ? intval($x['percent']) : 0,
-          'access'  => $access !== '' ? $access : ($owned ? 'granted' : 'locked'),
-          'isOwned' => $owned,
-          'excerpt' => isset($x['excerpt']) ? (string) $x['excerpt'] : '',
-          'video'   => isset($x['video']) ? $x['video'] : null,
+        $id = isset($entry['id']) ? (int) $entry['id'] : (isset($course['id']) ? (int) $course['id'] : 0);
+        $title = isset($entry['title']) ? (string) $entry['title'] : (
+          isset($course['name']) ? (string) $course['name'] : (
+            isset($course['title']) ? (string) $course['title'] : ''
+          )
+        );
+        $image = $entry['image'] ?? $course['thumb'] ?? $course['image'] ?? null;
+        $percent = isset($entry['percent']) ? (int) $entry['percent'] : (
+          isset($course['percent']) ? (int) $course['percent'] : 0
+        );
+        $status = $entry['access'] ?? $course['access'] ?? $course['access_status'] ?? 'locked';
+
+        $flags = [
+          !empty($entry['is_owned']),
+          !empty($entry['owned']),
+          !empty($entry['access_granted']),
+          !empty($entry['user_has_access']),
+          !empty($course['is_owned']),
+          !empty($course['owned']),
+          !empty($course['access_granted']),
+          !empty($course['user_has_access']),
         ];
-      }, is_array($raw) ? $raw : []);
 
-      $itemsOwned = array_values(array_filter($items, function ($i) {
-        return !empty($i['isOwned']);
+        $is_owned = in_array(true, $flags, true)
+          || in_array(strtolower((string) $status), ['owned', 'member', 'free', 'owned_by_product'], true);
+
+        $items[] = [
+          'id'       => $id,
+          'title'    => $title,
+          'image'    => $image,
+          'percent'  => $percent,
+          'access'   => $is_owned ? 'owned' : 'locked',
+          'is_owned' => $is_owned,
+        ];
+      }
+
+      $itemsOwned = array_values(array_filter($items, function ($course) {
+        return !empty($course['is_owned']);
       }));
 
-      return rest_ensure_response([
-        'items'      => $items,
+      return [
+        'items'      => array_values($items),
         'itemsOwned' => $itemsOwned,
         'total'      => count($items),
         'owned'      => count($itemsOwned),
-      ]);
+      ];
     },
   ]);
-
 });
+
