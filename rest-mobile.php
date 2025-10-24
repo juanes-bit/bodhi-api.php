@@ -9,16 +9,19 @@ add_action('rest_api_init', function () {
   register_rest_route('bodhi/v1', '/nonce', [
     'methods'  => 'GET',
     'permission_callback' => function () { return is_user_logged_in(); },
-    'callback' => function (WP_REST_Request $req) {
-      return new WP_REST_Response(['nonce' => wp_create_nonce('wp_rest')], 200);
+    'callback' => function ($req) {
+      return rest_ensure_response(['nonce' => wp_create_nonce('wp_rest')]);
     },
   ]);
 
   register_rest_route('bodhi/v1', '/my-courses', [
     'methods'  => 'GET',
     'permission_callback' => function () { return is_user_logged_in(); },
-    'callback' => function (WP_REST_Request $req) {
+    'callback' => function ($req) {
 
+      if (!class_exists('WP_REST_Request')) {
+        require_once ABSPATH . 'wp-includes/class-wp-rest-request.php';
+      }
       $inner = new WP_REST_Request('GET', '/bodhi/v1/courses');
       $inner->set_param('mode', 'union');
 
@@ -67,12 +70,12 @@ add_action('rest_api_init', function () {
         return !empty($i['isOwned']);
       }));
 
-      return new WP_REST_Response([
+      return rest_ensure_response([
         'items'      => $items,
         'itemsOwned' => $itemsOwned,
         'total'      => count($items),
         'owned'      => count($itemsOwned),
-      ], 200);
+      ]);
     },
   ]);
 

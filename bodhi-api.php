@@ -10,7 +10,12 @@ if ( ! defined('ABSPATH') ) exit;
 define('BODHI_API_VERSION', '0.2.1');
 define('BODHI_API_NS', 'bodhi/v1');
 
-require_once __DIR__ . '/rest-mobile.php'; // Carga directa de las rutas móviles.
+add_action('plugins_loaded', function () {
+  $rest_mobile = __DIR__ . '/rest-mobile.php';
+  if (file_exists($rest_mobile)) {
+    require_once $rest_mobile;
+  }
+}, 0);
 
 // --- Bridge REST para la app móvil (carga no intrusiva) ---
 add_action('plugins_loaded', function () {
