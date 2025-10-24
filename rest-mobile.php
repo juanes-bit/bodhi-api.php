@@ -35,35 +35,37 @@ add_action('rest_api_init', function () {
       $items = array_map(function ($x) {
         if (!is_array($x)) {
           return [
-            'id' => 0,
-            'title' => '',
-            'image' => null,
+            'id'      => 0,
+            'title'   => '',
+            'image'   => null,
             'percent' => 0,
-            'access' => 'locked',
+            'access'  => 'locked',
             'isOwned' => false,
             'excerpt' => '',
-            'video' => null,
+            'video'   => null,
           ];
         }
 
-        $access = $x['access'] ?? ($x['access_status'] ?? '');
+        $access = isset($x['access']) ? (string) $x['access'] : (isset($x['access_status']) ? (string) $x['access_status'] : '');
         $owned = !empty($x['is_owned'])
           || !empty($x['isOwned'])
-          || in_array($access, ['granted','owned','enrolled','allowed','member','free'], true);
+          || in_array($access, ['granted', 'owned', 'enrolled', 'allowed', 'member', 'free', 'owned_by_product'], true);
 
         return [
           'id'      => isset($x['id']) ? intval($x['id']) : 0,
-          'title'   => $x['title'] ?? '',
-          'image'   => $x['image'] ?? ($x['thumbnail'] ?? ($x['thumb'] ?? null)),
+          'title'   => isset($x['title']) ? (string) $x['title'] : '',
+          'image'   => isset($x['image']) ? $x['image'] : (isset($x['thumbnail']) ? $x['thumbnail'] : (isset($x['thumb']) ? $x['thumb'] : null)),
           'percent' => isset($x['percent']) ? intval($x['percent']) : 0,
-          'access'  => $access ?: ($owned ? 'granted' : 'locked'),
+          'access'  => $access !== '' ? $access : ($owned ? 'granted' : 'locked'),
           'isOwned' => $owned,
-          'excerpt' => $x['excerpt'] ?? '',
-          'video'   => $x['video'] ?? null,
+          'excerpt' => isset($x['excerpt']) ? (string) $x['excerpt'] : '',
+          'video'   => isset($x['video']) ? $x['video'] : null,
         ];
       }, is_array($raw) ? $raw : []);
 
-      $itemsOwned = array_values(array_filter($items, fn($i) => !empty($i['isOwned'])));
+      $itemsOwned = array_values(array_filter($items, function ($i) {
+        return !empty($i['isOwned']);
+      }));
 
       return new WP_REST_Response([
         'items'      => $items,
@@ -75,4 +77,3 @@ add_action('rest_api_init', function () {
   ]);
 
 });
-
