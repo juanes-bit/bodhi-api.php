@@ -1,97 +1,92 @@
 <?php
-// Archivo: rest-mobile.php
 if (!defined('ABSPATH')) { exit; }
 
+// Carga segura de REST móvil
 add_action('rest_api_init', function () {
-  $namespace = 'bodhi-mobile/v1';
 
-  register_rest_route($namespace, '/nonce', [
+  // /wp-json/bodhi-mobile/v1/me  → perfil rápido usando SOLO cookie
+  register_rest_route('bodhi-mobile/v1', '/me', [
     'methods'  => 'GET',
-    'permission_callback' => function () { return is_user_logged_in(); },
+    'permission_callback' => function () {
+      return is_user_logged_in();
+    },
     'callback' => function () {
-      return ['nonce' => wp_create_nonce('wp_rest')];
+      $u = wp_get_current_user();
+      return rest_ensure_response([
+        'id'    => (int) $u->ID,
+        'name'  => $u->display_name,
+        'email' => $u->user_email,
+      ]);
     },
   ]);
 
-  register_rest_route($namespace, '/my-courses', [
+  // /wp-json/bodhi-mobile/v1/my-courses  → proxy a tu lógica existente de cursos (union)
+  register_rest_route('bodhi-mobile/v1', '/my-courses', [
     'methods'  => 'GET',
-    'permission_callback' => function () { return is_user_logged_in(); },
-    'callback' => function () {
-      $req = new WP_REST_Request('GET', '/bodhi/v1/courses');
-      $req->set_param('mode', 'union');
-      $req->set_param('per_page', 50);
+    'permission_callback' => function () {
+      return is_user_logged_in(); // SOLO cookie, sin nonce
+    },
+    'callback' => function (WP_REST_Request $req) {
 
-      $resp = rest_do_request($req);
+      // Llama internamente a tu endpoint ya existente /bodhi/v1/courses?mode=union
+      $inner = new WP_REST_Request('GET', '/bodhi/v1/courses');
+      $inner->set_param('mode', 'union');
+      $inner->set_param('per_page', max(1, (int)($req->get_param('per_page') ?: 12)));
+
+      $resp = rest_do_request($inner);
+      if ($resp instanceof WP_Error) {
+        return $resp;
+      }
       if (is_wp_error($resp)) {
         return $resp;
       }
 
-      $data = $resp instanceof WP_REST_Response ? $resp->get_data() : $resp;
-
-      $source = [];
-      if (is_array($data)) {
-        if (isset($data['items']) && is_array($data['items'])) {
-          $source = $data['items'];
-        } else {
-          $source = $data;
-        }
-      }
+      $data = ($resp instanceof WP_REST_Response) ? $resp->get_data() : $resp;
+      $raw  = is_array($data) ? ($data['items'] ?? $data) : [];
 
       $items = [];
-      foreach ($source as $entry) {
-        if (!is_array($entry)) {
-          continue;
-        }
-
-        $course = isset($entry['course']) && is_array($entry['course']) ? $entry['course'] : [];
-
-        $id = isset($entry['id']) ? (int) $entry['id'] : (isset($course['id']) ? (int) $course['id'] : 0);
-        $title = isset($entry['title']) ? (string) $entry['title'] : (
-          isset($course['name']) ? (string) $course['name'] : (
-            isset($course['title']) ? (string) $course['title'] : ''
-          )
-        );
-        $image = $entry['image'] ?? $course['thumb'] ?? $course['image'] ?? null;
-        $percent = isset($entry['percent']) ? (int) $entry['percent'] : (
-          isset($course['percent']) ? (int) $course['percent'] : 0
-        );
-        $status = $entry['access'] ?? $course['access'] ?? $course['access_status'] ?? 'locked';
-
-        $flags = [
-          !empty($entry['is_owned']),
-          !empty($entry['owned']),
-          !empty($entry['access_granted']),
-          !empty($entry['user_has_access']),
-          !empty($course['is_owned']),
-          !empty($course['owned']),
-          !empty($course['access_granted']),
-          !empty($course['user_has_access']),
+      foreach ($raw as $c) {
+        $accessRaw = $c['access'] ?? ($c['access_status'] ?? '');
+        $hasFlag   = [
+          $c['is_owned'] ?? null,
+          $c['isOwned'] ?? null,
+          $c['owned'] ?? null,
+          $c['access_granted'] ?? null,
+          $c['user_has_access'] ?? null,
         ];
-
-        $is_owned = in_array(true, $flags, true)
-          || in_array(strtolower((string) $status), ['owned', 'member', 'free', 'owned_by_product'], true);
+        $isOwned = in_array(strtolower((string) $accessRaw), ['owned','member','free','owned_by_product','access_granted','has_access'], true)
+          || array_filter($hasFlag);
 
         $items[] = [
-          'id'       => $id,
-          'title'    => $title,
-          'image'    => $image,
-          'percent'  => $percent,
-          'access'   => $is_owned ? 'owned' : 'locked',
-          'is_owned' => $is_owned,
+          'id'      => (int)($c['id'] ?? 0),
+          'title'   => $c['course']['name'] ?? $c['title'] ?? '',
+          'image'   => $c['course']['thumb'] ?? $c['course']['thumbnail'] ?? $c['course']['image'] ?? null,
+          'percent' => isset($c['course']['percent']) ? (float) $c['course']['percent'] : 0,
+          'access'  => $isOwned ? 'owned' : 'locked',
+          'isOwned' => (bool) $isOwned,
         ];
       }
 
-      $itemsOwned = array_values(array_filter($items, function ($course) {
-        return !empty($course['is_owned']);
+      $owned = array_values(array_filter($items, function ($i) {
+        return !empty($i['isOwned']);
       }));
 
-      return [
-        'items'      => array_values($items),
-        'itemsOwned' => $itemsOwned,
+      return rest_ensure_response([
+        'items'      => $items,
+        'itemsOwned' => $owned,
         'total'      => count($items),
-        'owned'      => count($itemsOwned),
-      ];
+        'owned'      => count($owned),
+      ]);
     },
   ]);
-});
 
+  // (opcional) /nonce solo informativo para debugging
+  register_rest_route('bodhi-mobile/v1', '/nonce', [
+    'methods'  => 'GET',
+    'permission_callback' => '__return_true',
+    'callback' => function () {
+      return rest_ensure_response(['nonce' => wp_create_nonce('wp_rest')]);
+    },
+  ]);
+
+});
