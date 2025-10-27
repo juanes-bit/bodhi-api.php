@@ -228,8 +228,143 @@ function bodhi_is_staging() {
   return (strpos($host, 'staging.') !== false) || (defined('WP_ENV') && WP_ENV === 'staging');
 }
 
+function bodhi_cookie_domain_value() {
+  if (defined('COOKIE_DOMAIN') && COOKIE_DOMAIN) {
+    return COOKIE_DOMAIN;
+  }
+  $host = parse_url(home_url(), PHP_URL_HOST);
+  if (!is_string($host) || $host === '' || $host === 'localhost' || strpos($host, '.') === false) {
+    return '';
+  }
+  return $host;
+}
+
+function bodhi_cookie_samesite_value($secure) {
+  return $secure ? 'None' : 'Lax';
+}
+
+function bodhi_emit_login_cookies($user, $remember = true) {
+  if (!($user instanceof WP_User)) {
+    return new WP_Error('bodhi_login_invalid_user', 'Usuario inválido para emitir cookies.');
+  }
+
+  $remember = (bool) $remember;
+  $secure = is_ssl();
+  if (function_exists('wp_is_using_https') && wp_is_using_https()) {
+    $secure = true;
+  }
+
+  $expiration = time() + apply_filters('auth_cookie_expiration', ($remember ? 14 : 2) * DAY_IN_SECONDS, $user->ID, $remember);
+  $expire     = $remember ? $expiration + (12 * HOUR_IN_SECONDS) : 0;
+
+  $secure_logged_in_cookie = $secure && 'https' === parse_url(get_option('home'), PHP_URL_SCHEME);
+  $secure                  = apply_filters('secure_auth_cookie', $secure, $user->ID);
+  $secure_logged_in_cookie = apply_filters('secure_logged_in_cookie', $secure_logged_in_cookie, $user->ID, $secure);
+
+  $manager      = WP_Session_Tokens::get_instance($user->ID);
+  $session_token = $manager->create($expiration);
+
+  $scheme             = $secure ? 'secure_auth' : 'auth';
+  $auth_cookie_name   = $secure ? SECURE_AUTH_COOKIE : AUTH_COOKIE;
+  $auth_cookie_value  = wp_generate_auth_cookie($user->ID, $expiration, $scheme, $session_token);
+  $logged_in_value    = wp_generate_auth_cookie($user->ID, $expiration, 'logged_in', $session_token);
+
+  do_action('set_auth_cookie', $auth_cookie_value, $expire, $expiration, $user->ID, $scheme, $session_token);
+  do_action('set_logged_in_cookie', $logged_in_value, $expire, $expiration, $user->ID, 'logged_in', $session_token);
+
+  wp_set_current_user($user->ID);
+  nocache_headers();
+  do_action('wp_login', $user->user_login, $user);
+
+  $domain         = bodhi_cookie_domain_value();
+  $auth_samesite  = bodhi_cookie_samesite_value($secure);
+  $login_samesite = bodhi_cookie_samesite_value($secure_logged_in_cookie);
+
+  $cookie_domain = $domain ?: '';
+  $plugin_path   = defined('PLUGINS_COOKIE_PATH') ? PLUGINS_COOKIE_PATH : COOKIEPATH;
+  $admin_path    = defined('ADMIN_COOKIE_PATH') ? ADMIN_COOKIE_PATH : COOKIEPATH;
+  $cookie_path   = defined('COOKIEPATH') ? COOKIEPATH : '/';
+  $site_path     = defined('SITECOOKIEPATH') ? SITECOOKIEPATH : $cookie_path;
+
+  $auth_cookie_options = [
+    'expires'  => $expire,
+    'path'     => $plugin_path,
+    'secure'   => $secure,
+    'httponly' => true,
+    'samesite' => $auth_samesite,
+  ];
+  if ($cookie_domain !== '') {
+    $auth_cookie_options['domain'] = $cookie_domain;
+  }
+
+  setcookie($auth_cookie_name, $auth_cookie_value, $auth_cookie_options);
+  if ($admin_path !== $plugin_path) {
+    $admin_cookie_options = $auth_cookie_options;
+    $admin_cookie_options['path'] = $admin_path;
+    setcookie($auth_cookie_name, $auth_cookie_value, $admin_cookie_options);
+  }
+
+  $logged_in_options = [
+    'expires'  => $expire,
+    'path'     => $cookie_path,
+    'secure'   => $secure_logged_in_cookie,
+    'httponly' => false,
+    'samesite' => $login_samesite,
+  ];
+  if ($cookie_domain !== '') {
+    $logged_in_options['domain'] = $cookie_domain;
+  }
+
+  setcookie(LOGGED_IN_COOKIE, $logged_in_value, $logged_in_options);
+  if ($site_path !== $cookie_path) {
+    $site_cookie_options = $logged_in_options;
+    $site_cookie_options['path'] = $site_path;
+    setcookie(LOGGED_IN_COOKIE, $logged_in_value, $site_cookie_options);
+  }
+
+  return [
+    'token'      => $session_token,
+    'expiration' => $expiration,
+    'secure'     => $secure,
+  ];
+}
+
+/**
+ * Valida las cookies estándar de WordPress y prepara el usuario global.
+ */
+function bodhi_validate_cookie_user() {
+  $uid = wp_validate_auth_cookie('', 'logged_in');
+  if (!$uid) {
+    $scheme = is_ssl() ? 'secure_auth' : 'auth';
+    $uid = wp_validate_auth_cookie('', $scheme);
+  }
+  $uid = intval($uid);
+  if ($uid > 0) {
+    wp_set_current_user($uid);
+    return $uid;
+  }
+  return 0;
+}
+
+/**
+ * Callback legado usado por rutas antiguas que confían en la cookie.
+ */
 function bodhi_require_login() {
-  return is_user_logged_in();
+  if (is_user_logged_in()) {
+    return true;
+  }
+  return bodhi_validate_cookie_user() > 0;
+}
+
+/**
+ * Permiso REST que devuelve WP_Error 401 cuando no hay sesión válida.
+ */
+function bodhi_rest_permission_cookie() {
+  $uid = bodhi_validate_cookie_user();
+  if ($uid > 0) {
+    return true;
+  }
+  return new WP_Error('rest_forbidden', __('Lo siento, no tienes permisos para hacer eso.'), ['status' => 401]);
 }
 
 /**
@@ -627,60 +762,10 @@ add_action('rest_api_init', function () {
         return new WP_REST_Response(['error'=>'invalid_credentials','message'=>$user->get_error_message()], 401);
       }
 
-      // === crear sesión WP + EMITIR COOKIES explícitamente ===
-      wp_set_current_user( $user->ID );
-
-      $domain = 'staging.bodhimedicine.com';
-      $path   = '/';
-      $secure = is_ssl();
-
-      $session_token = wp_get_session_token();
-      $expiration    = time() + 14 * DAY_IN_SECONDS;
-
-      $logged_in_cookie_name  = 'wordpress_logged_in_' . COOKIEHASH;
-      $logged_in_cookie_value = wp_generate_auth_cookie( $user->ID, $expiration, 'logged_in', $session_token );
-
-      setcookie( $logged_in_cookie_name, $logged_in_cookie_value, [
-        'expires'  => $expiration,
-        'path'     => $path,
-        'domain'   => $domain,
-        'secure'   => $secure,
-        'httponly' => false,
-        'samesite' => 'Lax',
-      ]);
-      if ( defined('SITECOOKIEPATH') ) {
-        setcookie( $logged_in_cookie_name, $logged_in_cookie_value, [
-          'expires'  => $expiration,
-          'path'     => defined('SITECOOKIEPATH') ? SITECOOKIEPATH : $path,
-          'domain'   => $domain,
-          'secure'   => $secure,
-          'httponly' => false,
-          'samesite' => 'Lax',
-        ]);
+      $cookie_meta = bodhi_emit_login_cookies($user, true);
+      if (is_wp_error($cookie_meta)) {
+        return new WP_REST_Response(['error' => 'cookie_issue', 'message' => $cookie_meta->get_error_message()], 500);
       }
-
-      $auth_cookie_name  = ( $secure ? 'wordpress_sec_' : 'wordpress_' ) . COOKIEHASH;
-      $auth_cookie_value = wp_generate_auth_cookie( $user->ID, $expiration, 'secure_auth', $session_token );
-      setcookie( $auth_cookie_name, $auth_cookie_value, [
-        'expires'  => $expiration,
-        'path'     => defined('ADMIN_COOKIE_PATH') ? ADMIN_COOKIE_PATH : $path,
-        'domain'   => $domain,
-        'secure'   => $secure,
-        'httponly' => true,
-        'samesite' => 'Lax',
-      ]);
-
-      $logged_in_status_name = defined('LOGGED_IN_COOKIE') ? LOGGED_IN_COOKIE : $logged_in_cookie_name;
-      setcookie( $logged_in_status_name, $logged_in_cookie_value, [
-        'expires'  => $expiration,
-        'path'     => $path,
-        'domain'   => $domain,
-        'secure'   => $secure,
-        'httponly' => false,
-        'samesite' => 'Lax',
-      ]);
-
-      wp_set_auth_cookie( $user->ID, true, $secure );
 
       $nonce = wp_create_nonce('wp_rest');
 
@@ -690,6 +775,7 @@ add_action('rest_api_init', function () {
         'ok'    => true,
         'token' => $token,
         'user'  => ['id'=>$user->ID,'name'=>$user->display_name,'roles'=>$user->roles],
+        'session' => $cookie_meta,
         'nonce' => $nonce,
       ], 200);
     }
@@ -1444,25 +1530,24 @@ function bodhi_ajax_login() {
 
   if (is_user_logged_in()) { wp_logout(); }
 
-  $user = wp_signon([
-    'user_login'    => $username,
-    'user_password' => $password,
-    'remember'      => true,
-  ], is_ssl());
+  $user = wp_authenticate($username, $password);
 
   if (is_wp_error($user)) {
     wp_send_json(['ok'=>false, 'error'=>'invalid_credentials', 'message'=>$user->get_error_message()], 401);
   }
 
-  wp_set_current_user($user->ID);
-  wp_set_auth_cookie($user->ID, true, is_ssl());
+  $cookie_meta = bodhi_emit_login_cookies($user, true);
+  if (is_wp_error($cookie_meta)) {
+    wp_send_json(['ok'=>false, 'error'=>'cookie_issue', 'message'=>$cookie_meta->get_error_message()], 500);
+  }
 
   $nonce = wp_create_nonce('wp_rest');
 
   wp_send_json([
     'ok'   => true,
     'user' => ['id'=>$user->ID, 'name'=>$user->display_name, 'roles'=>$user->roles],
-    'nonce'=> $nonce
+    'nonce'=> $nonce,
+    'session' => $cookie_meta,
   ], 200);
 }
 

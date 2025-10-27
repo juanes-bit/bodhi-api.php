@@ -7,10 +7,12 @@ add_action('rest_api_init', function () {
   // /wp-json/bodhi-mobile/v1/me  → perfil rápido usando SOLO cookie
   register_rest_route('bodhi-mobile/v1', '/me', [
     'methods'  => 'GET',
-    'permission_callback' => function () {
-      return is_user_logged_in();
-    },
+    'permission_callback' => 'bodhi_rest_permission_cookie',
     'callback' => function () {
+      $uid = bodhi_validate_cookie_user();
+      if ($uid <= 0) {
+        return new WP_Error('rest_forbidden', __('Lo siento, no tienes permisos para hacer eso.'), ['status' => 401]);
+      }
       $u = wp_get_current_user();
       return rest_ensure_response([
         'id'    => (int) $u->ID,
@@ -23,15 +25,15 @@ add_action('rest_api_init', function () {
   // /wp-json/bodhi-mobile/v1/my-courses  → proxy a tu lógica existente de cursos (union)
   register_rest_route('bodhi-mobile/v1', '/my-courses', [
     'methods'  => 'GET',
-    'permission_callback' => function () {
-      return is_user_logged_in(); // SOLO cookie, sin nonce
-    },
+    'permission_callback' => 'bodhi_rest_permission_cookie',
     'callback' => function (WP_REST_Request $req) {
 
       // Llama internamente a tu endpoint ya existente /bodhi/v1/courses?mode=union
       $inner = new WP_REST_Request('GET', '/bodhi/v1/courses');
       $inner->set_param('mode', 'union');
       $inner->set_param('per_page', max(1, (int)($req->get_param('per_page') ?: 12)));
+
+      bodhi_validate_cookie_user();
 
       $resp = rest_do_request($inner);
       if ($resp instanceof WP_Error) {

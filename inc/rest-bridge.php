@@ -26,21 +26,15 @@ add_action('rest_api_init', function () {
         return new \WP_Error('invalid_email', 'Email no encontrado', ['status' => 401]);
       }
 
-      // Importante: usar user_login y no el email en wp_signon
-      $creds = [
-        'user_login'    => $user->user_login,
-        'user_password' => $pass,
-        'remember'      => true,
-      ];
-
-      $signed = wp_signon($creds, is_ssl());
+      $signed = wp_authenticate($user->user_login, $pass);
       if (is_wp_error($signed)) {
         return new \WP_Error('invalid_creds', 'Credenciales inválidas', ['status' => 401]);
       }
 
-      // Asegura el contexto del usuario y las cookies en la respuesta
-      wp_set_current_user($signed->ID);
-      nocache_headers();
+      $cookie_meta = bodhi_emit_login_cookies($signed, true);
+      if (is_wp_error($cookie_meta)) {
+        return $cookie_meta;
+      }
 
       // Si tu front necesita CORS con credenciales desde web, ajusta el origin específico (no "*")
       // header('Access-Control-Allow-Origin: https://staging.bodhimedicine.com');
@@ -56,6 +50,7 @@ add_action('rest_api_init', function () {
         // Este nonce es válido en ESTA request; el cliente debe pedir uno fresco luego.
         'nonce' => wp_create_nonce('wp_rest'),
         'token' => null,
+        'session' => $cookie_meta,
       ];
     },
   ]);
