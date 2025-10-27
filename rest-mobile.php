@@ -45,6 +45,7 @@ add_action('rest_api_init', function () {
       $data = ($resp instanceof WP_REST_Response) ? $resp->get_data() : $resp;
       $raw  = is_array($data) ? ($data['items'] ?? $data) : [];
       $items = [];
+      $ownedIds = [];
 
       foreach ($raw as $c) {
         $access = strtolower(trim((string) ($c['access'] ?? '')));
@@ -82,25 +83,29 @@ add_action('rest_api_init', function () {
         $reasonOk = count(array_intersect($reasons, ['owned_by_product', 'has_access', 'granted', 'enrolled'])) > 0;
         $isOwned  = $accessOk || $reasonOk || $anyFlag;
 
+        $itemId = (int) ($c['id'] ?? 0);
+
         $items[] = [
-          'id'      => (int) ($c['id'] ?? 0),
+          'id'      => $itemId,
           'title'   => $c['course']['name'] ?? $c['title'] ?? '',
           'image'   => $c['course']['thumb'] ?? $c['course']['thumbnail'] ?? $c['course']['image'] ?? null,
           'percent' => isset($c['course']['percent']) ? (float) $c['course']['percent'] : 0,
           'access'  => $isOwned ? 'owned' : 'locked',
-          'isOwned' => (bool) $isOwned,
+          'is_owned'=> (bool) $isOwned,
         ];
+
+        if ($isOwned && $itemId > 0) {
+          $ownedIds[] = $itemId;
+        }
       }
 
-      $owned = array_values(array_filter($items, function ($i) {
-        return !empty($i['isOwned']);
-      }));
+      $ownedIds = array_values(array_unique($ownedIds));
 
       return rest_ensure_response([
-        'items'      => $items,
-        'itemsOwned' => $owned,
-        'total'      => count($items),
-        'owned'      => count($owned),
+        'items'    => $items,
+        'ownedIds' => $ownedIds,
+        'total'    => count($items),
+        'owned'    => count($ownedIds),
       ]);
     },
   ]);
