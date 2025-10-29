@@ -24,6 +24,36 @@ add_action('plugins_loaded', function () {
 }, 1);
 // ----------------------------------------------------------
 
+function bodhi_arr_get($a, $k, $d = null) {
+  return (is_array($a) && array_key_exists($k, $a)) ? $a[$k] : $d;
+}
+
+function bodhi_truthy($v) {
+  return $v === true || $v === 'true' || $v === 1 || $v === '1' || $v === 'yes';
+}
+
+function bodhi_infer_is_owned(array $c): bool {
+  foreach (['isOwned','is_owned','owned','access_granted','has_access','owned_by_product'] as $k) {
+    if (bodhi_truthy(bodhi_arr_get($c, $k))) {
+      return true;
+    }
+  }
+  $access = strtolower((string) bodhi_arr_get($c, 'access', ''));
+  if (in_array($access, ['owned','member','free'], true)) {
+    return true;
+  }
+  $product = bodhi_arr_get($c, 'product');
+  if (is_array($product) && bodhi_truthy(bodhi_arr_get($product, 'has_access'))) {
+    return true;
+  }
+  foreach ((array) bodhi_arr_get($c, 'products', []) as $p) {
+    if (is_array($p) && bodhi_truthy(bodhi_arr_get($p, 'has_access'))) {
+      return true;
+    }
+  }
+  return false;
+}
+
 // === Forzar JSON en /bodhi/v1/courses aunque haya wp_die / fatales ===
 add_filter('wp_die_handler', function () {
   return function ($message, $title = '', $args = []) {
@@ -1166,7 +1196,7 @@ function bodhi_rest_get_courses(WP_REST_Request $req) {
   if (!$debug) {
     $cached = wp_cache_get($cache_key, 'bodhi');
     if ($cached !== false) {
-      return $cached;
+      return new WP_REST_Response($cached, 200);
     }
   }
 
@@ -1180,12 +1210,77 @@ function bodhi_rest_get_courses(WP_REST_Request $req) {
     return $items;
   }
 
-  if ($debug) {
-    return ['__debug' => $diag, 'items' => $items];
+  if ($items instanceof WP_REST_Response) {
+    $items = $items->get_data();
+  }
+  if (is_object($items)) {
+    $items = (array) $items;
   }
 
-  wp_cache_set($cache_key, $items, 'bodhi', 180);
-  return $items;
+  $owned_ids = [];
+  if (is_array($items) && isset($items['owned_ids'])) {
+    $owned_ids = is_array($items['owned_ids']) ? $items['owned_ids'] : [];
+  } elseif (is_array($items) && isset($items['ownedIds'])) {
+    $owned_ids = is_array($items['ownedIds']) ? $items['ownedIds'] : [];
+  }
+
+  $payload = [];
+  if (is_array($items) && isset($items['items']) && is_array($items['items'])) {
+    $payload = $items;
+  } else {
+    $payload = ['items' => is_array($items) ? array_values($items) : []];
+  }
+
+  $owned_ids = is_array($owned_ids ?? null) ? $owned_ids : [];
+  $owned_ids = array_values(array_filter(array_map('intval', $owned_ids)));
+
+  if (isset($payload['owned_ids'])) {
+    $payload['owned_ids'] = $owned_ids;
+  }
+  if (isset($payload['ownedIds'])) {
+    $payload['ownedIds'] = $owned_ids;
+  }
+
+  $normalize_id = function(array $c){
+    return (int) (
+      bodhi_arr_get($c,'id') ??
+      bodhi_arr_get($c,'ID') ??
+      bodhi_arr_get($c,'course_id') ??
+      bodhi_arr_get($c,'wp_post_id') ?? 0
+    );
+  };
+
+  $mark = function(array $c) use ($normalize_id,$owned_ids){
+    $id = $normalize_id($c);
+    $c['id'] = $id;
+    $owned = bodhi_infer_is_owned($c) || ($id && in_array($id,$owned_ids,true));
+    $c['isOwned'] = $owned;
+    $c['is_owned'] = $owned;
+    if ($owned && !isset($c['access'])) $c['access'] = 'owned';
+    return $c;
+  };
+
+  $payload_items_raw = is_array($payload['items'] ?? null) ? $payload['items'] : [];
+
+  $payload_items = array_map(function($course) {
+    if ($course instanceof WP_REST_Response) {
+      $course = $course->get_data();
+    }
+    if (is_object($course)) {
+      $course = (array) $course;
+    }
+    return is_array($course) ? $course : [];
+  }, $payload_items_raw);
+
+  $payload['items'] = array_map($mark, $payload_items);
+
+  if ($debug) {
+    $payload['__debug'] = $diag;
+    return new WP_REST_Response($payload, 200);
+  }
+
+  wp_cache_set($cache_key, $payload, 'bodhi', 180);
+  return new WP_REST_Response($payload, 200);
 }
 
 function bodhi_outline_from_thrive(WP_REST_Request $req) {
