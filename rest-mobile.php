@@ -30,18 +30,28 @@ add_action('rest_api_init', function () {
 
       bodhi_validate_cookie_user();
       $_GET['mode'] = 'union';
-      $inner = new WP_REST_Request('GET', '/bodhi/v1/courses');
-      $inner->set_param('mode', 'union');
-      $inner->set_param('per_page', max(1, (int)($req->get_param('per_page') ?: 24)));
+      $page = max(1, (int) ($req->get_param('page') ?: 1));
+      $per_page = max(1, min(50, (int) ($req->get_param('per_page') ?: 24)));
+      $owned_param = $req->get_param('owned');
+      $owned_only = is_null($owned_param) ? true : (bool) filter_var($owned_param, FILTER_VALIDATE_BOOLEAN);
+      $debug = (bool) filter_var($req->get_param('debug'), FILTER_VALIDATE_BOOLEAN);
 
-      $resp = bodhi_rest_get_courses($inner);
-      if (is_wp_error($resp)) {
-        return $resp;
+      $diag = null;
+      $payload = bodhi_prepare_courses_payload($page, $per_page, $owned_only, 'union', $debug, $diag);
+      if (is_wp_error($payload)) {
+        if ($debug && $diag !== null && is_array($diag)) {
+          $payload->add_data(['__debug' => $diag]);
+        }
+        return $payload;
       }
-      if ($resp instanceof WP_REST_Response) {
-        return $resp;
+
+      $response = bodhi_emit_courses($payload['items'], $payload['owned_ids']);
+      if ($debug && is_array($diag)) {
+        $data = $response->get_data();
+        $data['__debug'] = $diag;
+        $response->set_data($data);
       }
-      return rest_ensure_response($resp);
+      return $response;
     },
   ]);
 
