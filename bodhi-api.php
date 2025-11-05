@@ -11,11 +11,9 @@ define('BODHI_API_VERSION', '0.2.1');
 define('BODHI_API_NS', 'bodhi/v1');
 
 add_action('plugins_loaded', function () {
-  $rest_mobile = __DIR__ . '/rest-mobile.php';
-  if (file_exists($rest_mobile)) {
-    require_once $rest_mobile;
-  }
-}, 0);
+  $path = __DIR__ . '/rest-mobile.php';
+  if (file_exists($path)) { require_once $path; }
+});
 
 // --- Bridge REST para la app móvil (carga no intrusiva) ---
 add_action('plugins_loaded', function () {
@@ -87,9 +85,12 @@ function bodhi_normalize_course_item(array $raw, array $owned_set = []): array {
     }
   }
   $image = bodhi_abs_url(bodhi_arr_get($r, 'cover_image'))
+        ?: bodhi_abs_url(bodhi_arr_get($r, 'cover'))
         ?: bodhi_abs_url(bodhi_arr_get($r, 'image'))
         ?: bodhi_abs_url(bodhi_arr_get($r, 'thumbnail'))
-        ?: bodhi_abs_url(bodhi_arr_get($r, 'featured_image'));
+        ?: bodhi_abs_url(bodhi_arr_get($r, 'featured_image'))
+        ?: bodhi_abs_url(bodhi_arr_get($r, 'featured_image_url'))
+        ?: bodhi_abs_url(bodhi_arr_get($r, 'thumb'));
   $summary = null;
   foreach (['summary','excerpt','description','text','post_excerpt','short_description'] as $k) {
     $v = bodhi_arr_get($r, $k);
@@ -101,19 +102,140 @@ function bodhi_normalize_course_item(array $raw, array $owned_set = []): array {
   $owned = bodhi_infer_is_owned($r, $owned_set);
   $out = $r;
   $out['id'] = $id;
+  $out['courseId'] = $id;
   $out['title'] = $title;
-  $out['image'] = $image ?: null;
+  if (!empty($image)) {
+    $out['image'] = $image;
+  } elseif (!empty($out['image'])) {
+    $out['image'] = bodhi_abs_url($out['image']);
+  } elseif (!empty($out['thumb'])) {
+    $out['image'] = bodhi_abs_url($out['thumb']);
+  } else {
+    $out['image'] = null;
+  }
+  if (!empty($out['thumb']) && empty($image)) {
+    $out['thumb'] = bodhi_abs_url($out['thumb']);
+  }
+
   $out['summary'] = $summary;
+  $out['excerpt'] = $summary;
   $out['isOwned'] = $owned;
-  if ($owned && empty($out['access'])) $out['access'] = 'owned';
+  $out['is_owned'] = $owned;
+
+  $percent = null;
+  foreach (['percent','progress','percentage','percent_complete','completion'] as $pk) {
+    $pv = bodhi_arr_get($out, $pk);
+    if (is_array($pv)) {
+      foreach (['percent','percentage','progress','value'] as $subk) {
+        if (isset($pv[$subk])) {
+          $pv = $pv[$subk];
+          break;
+        }
+      }
+    }
+    if (is_numeric($pv)) {
+      $percent = (float) $pv;
+      break;
+    }
+  }
+  if (!is_null($percent)) {
+    if ($percent > 0 && $percent <= 1 && $percent != round($percent)) {
+      $percent *= 100;
+    }
+    $percent = max(0, min(100, (int) round($percent)));
+  } else {
+    $percent = 0;
+  }
+  $out['percent'] = $percent;
+
+  $modules_count = null;
+  foreach (['modules_count','module_count','modules_total','modulesCount'] as $mk) {
+    $mv = bodhi_arr_get($out, $mk);
+    if (is_numeric($mv)) {
+      $modules_count = (int) $mv;
+      break;
+    }
+  }
+  if ($modules_count === null) {
+    $modules = bodhi_arr_get($out, 'modules');
+    if (is_array($modules)) {
+      $modules_count = count($modules);
+    }
+  }
+  if ($modules_count === null) {
+    $modules_count = 0;
+  }
+  $out['modules_count'] = $modules_count;
+
+  $lessons_count = null;
+  foreach (['lessons_count','lesson_count','lessons_total','lessonsCount','lessonTotal'] as $lk) {
+    $lv = bodhi_arr_get($out, $lk);
+    if (is_numeric($lv)) {
+      $lessons_count = (int) $lv;
+      break;
+    }
+  }
+  if ($lessons_count === null) {
+    $lessons = bodhi_arr_get($out, 'lessons');
+    if (is_array($lessons)) {
+      $lessons_count = count($lessons);
+    }
+  }
+  if ($lessons_count === null) {
+    $lessons_count = 0;
+  }
+  $out['lessons_count'] = $lessons_count;
+
+  $access = strtolower((string) bodhi_arr_get($out, 'access', ''));
+  if ($owned) {
+    $out['access'] = 'owned';
+  } else {
+    if (in_array($access, ['owned','member','free','granted','enrolled','owned_by_product'], true)) {
+      $out['access'] = 'owned';
+    } else {
+      $out['access'] = 'locked';
+    }
+  }
+
   return $out;
 }
 
 function bodhi_emit_courses(array $items, array $owned_ids = []): WP_REST_Response {
-  $owned_set = array_fill_keys(array_map('intval', $owned_ids), true);
+  $owned_ids = array_values(array_unique(array_filter(array_map('intval', $owned_ids), fn($id) => $id > 0)));
+  $owned_set = array_fill_keys($owned_ids, true);
   $norm = array_map(fn($x) => bodhi_normalize_course_item((array) $x, $owned_set), (array) $items);
+
+  $items_owned = $owned_ids;
+  foreach ($norm as &$item) {
+    $cid = isset($item['id']) ? (int) $item['id'] : 0;
+    $is_owned = bodhi_truthy($item['is_owned'] ?? null) || bodhi_truthy($item['isOwned'] ?? null) || ($cid > 0 && isset($owned_set[$cid]));
+    $item['isOwned'] = $is_owned;
+    $item['is_owned'] = $is_owned;
+    if (!isset($item['courseId'])) {
+      $item['courseId'] = $cid;
+    }
+    if ($is_owned && $cid > 0) {
+      $items_owned[] = $cid;
+      $item['access'] = 'owned';
+    } elseif (!$is_owned) {
+      $item['access'] = 'locked';
+    }
+  }
+  unset($item);
+
+  $items_owned = array_values(array_unique(array_filter(array_map('intval', $items_owned), fn($id) => $id > 0)));
+  sort($items_owned, SORT_NUMERIC);
+
+  $data = [
+    'total'      => count($norm),
+    'owned'      => count($items_owned),
+    'itemsOwned' => $items_owned,
+    'owned_ids'  => $items_owned,
+    'items'      => array_values($norm),
+  ];
+
   if (function_exists('nocache_headers')) nocache_headers();
-  return new WP_REST_Response(['items' => $norm], 200);
+  return new WP_REST_Response($data, 200);
 }
 
 function bodhi_prepare_courses_payload(int $page, int $per_page, bool $owned_only, string $mode, bool $debug, &$diag = null) {
@@ -1554,42 +1676,122 @@ function bodhi_course_detail_normalized(WP_REST_Request $req) {
     return new WP_Error('bad_request', 'ID de curso inválido', ['status' => 400]);
   }
 
-  $r = bodhi_fetch_json("tva-public/v1/course/{$course_id}/items");
-  if (empty($r['ok'])) {
+  $items_resp = bodhi_fetch_json("tva-public/v1/course/{$course_id}/items");
+  if (empty($items_resp['ok'])) {
     return new WP_Error(
       'bodhi_upstream',
       'Thrive items error',
-      ['status' => 502, 'upstream_code' => $r['code'] ?? 0]
+      ['status' => 502, 'upstream_code' => $items_resp['code'] ?? 0]
     );
   }
 
-  $items = is_array($r['data']) ? $r['data'] : [];
+  $items = is_array($items_resp['data']) ? $items_resp['data'] : [];
   $modules_src = isset($items['modules']) && is_array($items['modules']) ? $items['modules'] : [];
   $lessons_src = isset($items['lessons']) && is_array($items['lessons']) ? $items['lessons'] : [];
+  $course_meta = [];
+  if (isset($items['course']) && is_array($items['course'])) {
+    $course_meta = $items['course'];
+  } else {
+    $course_resp = bodhi_fetch_json("tva-public/v1/course/{$course_id}");
+    if (!empty($course_resp['ok']) && is_array($course_resp['data'])) {
+      $course_meta = $course_resp['data'];
+    }
+  }
 
-  $modules = array_map(function ($m) {
-    $id = $m['id'] ?? ($m['ID'] ?? null);
-    return [
-      'id'           => $id !== null ? (int) $id : null,
-      'title'        => isset($m['post_title']) ? (string) $m['post_title'] : '',
-      'order'        => isset($m['order']) ? (int) $m['order'] : 0,
-      'cover_image'  => isset($m['cover_image']) ? (string) $m['cover_image'] : '',
-      'publish_date' => $m['publish_date'] ?? null,
+  $resolve_string = function ($source, array $keys, $default = '') {
+    foreach ($keys as $key) {
+      $value = bodhi_arr_get($source, $key);
+      if (is_array($value)) {
+        if (isset($value['rendered']) && is_string($value['rendered'])) {
+          $value = $value['rendered'];
+        } elseif (isset($value['value']) && is_string($value['value'])) {
+          $value = $value['value'];
+        } elseif (isset($value['url']) && is_string($value['url'])) {
+          $value = $value['url'];
+        } else {
+          continue;
+        }
+      }
+      if (is_string($value) && trim($value) !== '') {
+        return trim($value);
+      }
+    }
+    return $default;
+  };
+
+  $post = get_post($course_id);
+  $title = $resolve_string($course_meta, ['title', 'name', 'post_title'], '');
+  if ($title === '' && $post instanceof WP_Post) {
+    $title = get_the_title($post);
+  }
+  $title = $title !== '' ? wp_strip_all_tags($title) : 'Curso #' . $course_id;
+
+  $summary_raw = $resolve_string($course_meta, ['summary','excerpt','description','short_description','post_excerpt','text'], '');
+  if ($summary_raw === '' && isset($items['course']['excerpt'])) {
+    $summary_raw = $resolve_string($items['course'], ['excerpt'], '');
+  }
+  if ($summary_raw === '' && $post instanceof WP_Post) {
+    $excerpt = $post->post_excerpt ?: $post->post_content;
+    $summary_raw = is_string($excerpt) ? $excerpt : '';
+  }
+  $summary = trim(wp_strip_all_tags($summary_raw));
+
+  $cover = bodhi_abs_url($resolve_string($course_meta, ['cover_image','featured_image','featured_image_url','thumbnail','image'], null));
+  if (!$cover && isset($items['course'])) {
+    $cover = bodhi_abs_url($resolve_string($items['course'], ['cover_image','featured_image','featured_image_url','thumbnail','image'], null));
+  }
+
+  $trailer = $resolve_string($course_meta, ['trailer','trailer_url','preview_video','preview_video_url','promo_video','promoVideo','video_preview','video_preview_url'], '');
+  if ($trailer === '' && isset($course_meta['trailer']) && is_array($course_meta['trailer'])) {
+    $trailer = $resolve_string($course_meta['trailer'], ['url','source'], '');
+  }
+  if ($trailer === '' && isset($items['course'])) {
+    $trailer = $resolve_string($items['course'], ['trailer','trailer_url','preview_video','preview_video_url','promo_video','promoVideo'], '');
+  }
+  $trailer = $trailer !== '' ? bodhi_abs_url($trailer) : null;
+
+  $modules_map = [];
+  $module_key_map = [];
+  foreach ($modules_src as $idx => $module_src) {
+    $mid = $module_src['id'] ?? ($module_src['ID'] ?? null);
+    $mid = $mid !== null ? (int) $mid : null;
+    $key = $mid ?? ('idx_' . $idx);
+    $module_item = [
+      'id'           => $mid,
+      'title'        => wp_strip_all_tags((string) bodhi_arr_get($module_src, 'post_title', '')),
+      'order'        => isset($module_src['order']) ? (int) $module_src['order'] : 0,
+      'cover_image'  => bodhi_abs_url(bodhi_arr_get($module_src, 'cover_image')),
+      'publish_date' => $module_src['publish_date'] ?? null,
       'schema'       => (object)[],
+      'lessons'      => [],
     ];
-  }, $modules_src);
+    if (!$module_item['title']) {
+      $module_item['title'] = 'Módulo ' . ($idx + 1);
+    }
+    $modules_map[$key] = $module_item;
+    if ($mid !== null) {
+      $module_key_map[$mid] = $key;
+    }
+  }
 
-  $lessons = array_map(function ($l) {
-    $id = $l['id'] ?? ($l['ID'] ?? null);
-    $module_id = $l['module_id'] ?? ($l['post_parent'] ?? null);
-    $type = $l['lesson_type'] ?? null;
-    if (!$type && !empty($l['video']['source'])) {
+  $lessons = [];
+  $orphans = [];
+  foreach ($lessons_src as $idx => $lesson_src) {
+    $lid = $lesson_src['id'] ?? ($lesson_src['ID'] ?? null);
+    $lid = $lid !== null ? (int) $lid : null;
+    $module_id = $lesson_src['module_id'] ?? ($lesson_src['post_parent'] ?? null);
+    $module_id = $module_id !== null ? (int) $module_id : null;
+    $type = $lesson_src['lesson_type'] ?? null;
+    if (!$type && !empty($lesson_src['video']['source'])) {
       $type = 'video';
     }
     if (!$type) {
       $type = 'article';
     }
-    $video_url = isset($l['video']['source']) ? (string) $l['video']['source'] : '';
+    $video_url = isset($lesson_src['video']['source']) ? (string) $lesson_src['video']['source'] : '';
+    if ($video_url === '' && isset($lesson_src['video_url'])) {
+      $video_url = (string) $lesson_src['video_url'];
+    }
     $media = null;
     if ($video_url !== '') {
       $parsed = bodhi_parse_vimeo($video_url);
@@ -1601,42 +1803,142 @@ function bodhi_course_detail_normalized(WP_REST_Request $req) {
         ];
       }
     }
-    return [
-      'id'          => $id !== null ? (int) $id : null,
-      'moduleId'    => $module_id !== null ? (int) $module_id : null,
-      'title'       => isset($l['post_title']) ? (string) $l['post_title'] : '',
-      'type'        => (string) $type,
-      'url'         => $video_url,
-      'order'       => isset($l['order']) ? (int) $l['order'] : 0,
-      'preview_url' => isset($l['preview_url']) ? (string) $l['preview_url'] : '',
-      'media'       => $media,
-    ];
-  }, $lessons_src);
 
-  if (empty($modules) && !empty($lessons)) {
+    $duration = null;
+    foreach (['duration','video_duration','length','duration_seconds','lesson_duration'] as $dk) {
+      $dv = bodhi_arr_get($lesson_src, $dk);
+      if (is_numeric($dv)) {
+        $duration = (int) $dv;
+        break;
+      }
+    }
+    if ($duration === null && isset($lesson_src['video']) && is_array($lesson_src['video'])) {
+      foreach (['duration','length','seconds'] as $dk) {
+        $dv = $lesson_src['video'][$dk] ?? null;
+        if (is_numeric($dv)) {
+          $duration = (int) $dv;
+          break;
+        }
+      }
+    }
+    if ($duration === null) {
+      $duration = 0;
+    }
+
+    $download = false;
+    $download_url = null;
+    foreach (['download_url','download_link','downloadUrl','downloadLink'] as $dlk) {
+      $dv = bodhi_arr_get($lesson_src, $dlk);
+      if (is_string($dv) && trim($dv) !== '') {
+        $download_url = bodhi_abs_url($dv);
+        $download = true;
+        break;
+      }
+    }
+    if (!$download) {
+      foreach (['download','downloadable','allow_download','download_enabled','can_download'] as $flag) {
+        if (bodhi_truthy(bodhi_arr_get($lesson_src, $flag))) {
+          $download = true;
+          break;
+        }
+      }
+    }
+
+    $lesson = [
+      'id'           => $lid,
+      'moduleId'     => $module_id,
+      'title'        => isset($lesson_src['post_title']) ? (string) $lesson_src['post_title'] : '',
+      'type'         => (string) $type,
+      'url'          => $video_url,
+      'order'        => isset($lesson_src['order']) ? (int) $lesson_src['order'] : 0,
+      'preview_url'  => isset($lesson_src['preview_url']) ? (string) $lesson_src['preview_url'] : '',
+      'media'        => $media,
+      'duration'     => $duration,
+      'vimeo_id'     => $media['id'] ?? null,
+      'download'     => $download,
+      'download_url' => $download_url,
+    ];
+    if ($lesson['title'] === '') {
+      $lesson['title'] = 'Lección ' . ($idx + 1);
+    }
+
+    $lessons[] = $lesson;
+
+    $module_key = null;
+    if ($module_id !== null && isset($module_key_map[$module_id])) {
+      $module_key = $module_key_map[$module_id];
+    } elseif ($module_id !== null && isset($modules_map[$module_id])) {
+      $module_key = $module_id;
+    }
+
+    if ($module_key !== null && isset($modules_map[$module_key])) {
+      $modules_map[$module_key]['lessons'][] = $lesson;
+    } else {
+      $orphans[] = $lesson;
+    }
+  }
+
+  if (empty($modules_map) && !empty($lessons)) {
     $single_id = (int) ($course_id . '001');
-    $modules = [[
-      'id'           => $single_id,
-      'title'        => 'Contenido',
-      'order'        => 0,
-      'cover_image'  => '',
-      'publish_date' => null,
-      'schema'       => (object)[],
-    ]];
     foreach ($lessons as &$lesson_ref) {
       if (empty($lesson_ref['moduleId'])) {
         $lesson_ref['moduleId'] = $single_id;
       }
     }
     unset($lesson_ref);
+    $modules_map['fallback'] = [
+      'id'           => $single_id,
+      'title'        => 'Contenido',
+      'order'        => 0,
+      'cover_image'  => '',
+      'publish_date' => null,
+      'schema'       => (object)[],
+      'lessons'      => $lessons,
+    ];
+  } elseif (!empty($orphans)) {
+    $fallback_id = (int) ($course_id . '999');
+    foreach ($orphans as &$orphan_ref) {
+      if (empty($orphan_ref['moduleId'])) {
+        $orphan_ref['moduleId'] = $fallback_id;
+      }
+    }
+    unset($orphan_ref);
+    $modules_map['orphans'] = [
+      'id'           => $fallback_id,
+      'title'        => 'Contenido',
+      'order'        => max(array_map(fn($m) => $m['order'] ?? 0, $modules_map)) + 1,
+      'cover_image'  => '',
+      'publish_date' => null,
+      'schema'       => (object)[],
+      'lessons'      => $orphans,
+    ];
+  }
+
+  $modules = array_values($modules_map);
+  usort($modules, function ($a, $b) {
+    return ($a['order'] <=> $b['order']) ?: ((int) $a['id'] <=> (int) $b['id']);
+  });
+
+  $progress_source = bodhi_progress_summary($course_id);
+  $progress = [
+    'done'    => isset($progress_source['done']) ? (int) $progress_source['done'] : 0,
+    'total'   => isset($progress_source['total']) ? (int) $progress_source['total'] : (int) count($lessons),
+    'percent' => isset($progress_source['pct']) ? (int) $progress_source['pct'] : 0,
+  ];
+  if ($progress['total'] <= 0) {
+    $progress['total'] = count($lessons);
+  }
+  if ($progress['total'] > 0 && $progress['percent'] <= 0 && $progress['done'] > 0) {
+    $progress['percent'] = (int) round(($progress['done'] / $progress['total']) * 100);
   }
 
   $base = [
     'id'            => $course_id,
-    'title'         => '',
-    'slug'          => '',
-    'cover'         => '',
-    'summary'       => '',
+    'title'         => $title,
+    'slug'          => $post instanceof WP_Post ? $post->post_name : '',
+    'cover'         => $cover ?: '',
+    'summary'       => $summary,
+    'trailer'       => $trailer,
     'lessons_count' => count($lessons),
     'access'        => 'granted',
   ];
@@ -1646,6 +1948,7 @@ function bodhi_course_detail_normalized(WP_REST_Request $req) {
     [
       'modules' => array_values($modules),
       'lessons' => array_values($lessons),
+      'progress' => $progress,
     ]
   ));
 }
