@@ -2,12 +2,12 @@
 /**
  * Plugin Name: Bodhi API
  * Description: REST API para la app Bodhi (lee cursos de Thrive Apprentice o CPT propio) + WPML.
- * Version: 0.2.1
+ * Version: 0.3.0
  * Author: JECT
  */
 if ( ! defined('ABSPATH') ) exit;
 
-define('BODHI_API_VERSION', '0.2.1');
+define('BODHI_API_VERSION', '0.3.0');
 define('BODHI_API_NS', 'bodhi/v1');
 
 add_action('plugins_loaded', function () {

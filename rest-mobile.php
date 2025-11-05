@@ -8,6 +8,25 @@ if (!defined('ABSPATH')) { exit; }
 
 add_action('rest_api_init', function () {
 
+  // 0) Verifica sesión (back-compat con apps actuales)
+  register_rest_route('bodhi-mobile/v1', '/me', [
+    'methods'  => 'GET',
+    'permission_callback' => function () { return is_user_logged_in(); },
+    'callback' => function (WP_REST_Request $req) {
+      $u = wp_get_current_user();
+      if (!$u || !$u->ID) {
+        return new WP_Error('rest_forbidden', 'No autorizado', ['status' => 401]);
+      }
+      return rest_ensure_response([
+        'id'        => (int) $u->ID,
+        'email'     => $u->user_email,
+        'name'      => $u->display_name,
+        'roles'     => $u->roles,
+        'logged_in' => true,
+      ]);
+    },
+  ]);
+
   // 1) Nonce opcional (para clientes que lo necesiten)
   register_rest_route('bodhi-mobile/v1', '/nonce', [
     'methods'  => 'GET',
@@ -34,7 +53,7 @@ add_action('rest_api_init', function () {
       $inner->set_param('mode', 'union');
 
       $resp = rest_do_request($inner);
-      if ($resp->is_error()) {
+      if (is_wp_error($resp)) {
         return $resp;
       }
       $data = $resp->get_data();
@@ -107,6 +126,37 @@ add_action('rest_api_init', function () {
       // Cache corto por usuario (escala: 6k+ estudiantes)
       set_transient('bodhi_mobile_my_courses_' . $user_id, $out, 60); // 60s para evitar thundering herd
       return rest_ensure_response($out);
+    },
+  ]);
+});
+
+add_action('rest_api_init', function () {
+  register_rest_route('bm/v1', '/form-login', [
+    'methods'  => 'POST',
+    'permission_callback' => '__return_true',
+    'callback' => function (WP_REST_Request $req) {
+      $p = $req->get_json_params();
+      $creds = [
+        'user_login'    => $p['email'] ?? '',
+        'user_password' => $p['password'] ?? '',
+        'remember'      => true,
+      ];
+      $user = wp_signon($creds, false);
+      if (is_wp_error($user)) {
+        return new WP_Error('auth_failed', 'Credenciales inválidas', ['status' => 403]);
+      }
+      wp_set_current_user($user->ID);
+      wp_set_auth_cookie($user->ID, true);
+      $nonce = wp_create_nonce('wp_rest');
+      return rest_ensure_response([
+        'ok'    => true,
+        'nonce' => $nonce,
+        'user'  => [
+          'id'    => (int) $user->ID,
+          'email' => $user->user_email,
+          'name'  => $user->display_name,
+        ],
+      ]);
     },
   ]);
 });
