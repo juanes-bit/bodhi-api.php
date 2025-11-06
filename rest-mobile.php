@@ -11,7 +11,7 @@ add_action('rest_api_init', function () {
   // 0) Verifica sesión (back-compat con apps actuales)
   register_rest_route('bodhi-mobile/v1', '/me', [
     'methods'  => 'GET',
-    'permission_callback' => function () { return is_user_logged_in(); },
+    'permission_callback' => 'bodhi_rest_permission_cookie',
     'callback' => function (WP_REST_Request $req) {
       $u = wp_get_current_user();
       if (!$u || !$u->ID) {
@@ -30,7 +30,7 @@ add_action('rest_api_init', function () {
   // 1) Nonce opcional (para clientes que lo necesiten)
   register_rest_route('bodhi-mobile/v1', '/nonce', [
     'methods'  => 'GET',
-    'permission_callback' => function () { return is_user_logged_in(); },
+    'permission_callback' => 'bodhi_rest_permission_cookie',
     'callback' => function () {
       return ['nonce' => wp_create_nonce('wp_rest')];
     },
@@ -39,7 +39,7 @@ add_action('rest_api_init', function () {
   // 2) Mis cursos con marca de propiedad por item
   register_rest_route('bodhi-mobile/v1', '/my-courses', [
     'methods'  => 'GET',
-    'permission_callback' => function () { return is_user_logged_in(); }, // cookie-only
+    'permission_callback' => 'bodhi_rest_permission_cookie', // cookie-only
     'callback' => function (WP_REST_Request $req) {
 
       $user_id = get_current_user_id();
@@ -61,51 +61,83 @@ add_action('rest_api_init', function () {
       $items = [];
       $owned_ids = [];
 
-      // Ayudantes de acceso (tolerantes a diferentes claves/formatos)
-      $is_owned_fn = function ($it) use (&$owned_ids) {
-        $access = isset($it['access']) ? $it['access'] : ($it['access_status'] ?? null);
-        $owned = (
-          !empty($it['is_owned']) ||
-          !empty($it['owned']) ||
-          (is_string($access) && strtolower($access) === 'owned') ||
-          (isset($it['access_granted']) && !!$it['access_granted'])
-        );
-        if ($owned) {
-          $owned_ids[] = intval($it['id'] ?? $it['ID'] ?? $it['course_id'] ?? $it['wp_post_id'] ?? 0);
-        }
-        return $owned;
+      // Helpers
+      $boolish = function ($v) {
+        if (is_bool($v)) return $v;
+        $t = is_string($v) ? strtolower(trim($v)) : $v;
+        return in_array($t, [1, '1', 'true', 'yes', 'y', 'owned'], true);
       };
-
       $normalize_id = function ($it) {
-        return intval($it['id'] ?? $it['ID'] ?? $it['course_id'] ?? $it['wp_post_id'] ?? $it['post_id'] ?? $it['courseId'] ?? 0);
+        return intval(
+          $it['id'] ??
+          $it['ID'] ??
+          $it['course_id'] ??
+          $it['wp_post_id'] ??
+          $it['post_id'] ??
+          $it['courseId'] ??
+          0
+        );
       };
 
-      $src_items = is_array($data['items'] ?? null) ? $data['items'] : [];
-      foreach ($src_items as $it) {
-        $id = $normalize_id($it);
-        if (!$id) {
-          continue;
+      // Soportar data.items o data.data.items
+      $src_items = [];
+      if (is_array($data)) {
+        if (!empty($data['items']) && is_array($data['items'])) {
+          $src_items = $data['items'];
+        } elseif (!empty($data['data']['items']) && is_array($data['data']['items'])) {
+          $src_items = $data['data']['items'];
         }
+      }
 
-        $owned = $is_owned_fn($it);
+      foreach ($src_items as $node) {
+        // Aplana wrapper tipo { course:{...}, owned_by_product:... }
+        $raw = (is_array($node) && !empty($node['course']) && is_array($node['course'])) ? $node['course'] : $node;
+
+        $id = $normalize_id($raw);
+        if (!$id) continue;
+
+        // Señales de propiedad (wrapper + item)
+        $accessRaw = $raw['access'] ?? ($node['access'] ?? null);
+        $owned =
+          $boolish($raw['is_owned'] ?? null) ||
+          $boolish($raw['owned'] ?? null) ||
+          $boolish($raw['access_granted'] ?? null) ||
+          $boolish($node['owned_by_product'] ?? null) ||
+          $boolish($node['has_access'] ?? null) ||
+          (is_string($accessRaw) && strtolower($accessRaw) === 'owned');
+
+        if ($owned) { $owned_ids[] = $id; }
+
+        // Salida normalizada (contrato móvil)
         $items[] = [
           'id'            => $id,
-          'courseId'      => $id, // alias consistente para el cliente
-          'title'         => $it['title'] ?? $it['name'] ?? '',
-          'image'         => $it['image'] ?? $it['thumbnail'] ?? '',
-          'excerpt'       => $it['excerpt'] ?? $it['summary'] ?? '',
-          'percent'       => intval($it['percent'] ?? $it['progress_percent'] ?? 0),
-          'modules_count' => intval($it['modules_count'] ?? 0),
-          'lessons_count' => intval($it['lessons_count'] ?? 0),
+          'courseId'      => $id,
+          'title'         => $raw['title'] ?? $raw['name'] ?? '',
+          'image'         => $raw['image'] ?? $raw['thumbnail'] ?? '',
+          'excerpt'       => $raw['excerpt'] ?? $raw['summary'] ?? '',
+          'percent'       => intval($raw['percent'] ?? $raw['progress_percent'] ?? 0),
+          'modules_count' => intval($raw['modules_count'] ?? 0),
+          'lessons_count' => intval($raw['lessons_count'] ?? 0),
           'access'        => $owned ? 'owned' : 'locked',
           'is_owned'      => $owned,
         ];
       }
 
-      // Si el "union" no marcó propiedad por item, intentamos lista secundaria:
-      $owned_list = array_map('intval', $data['itemsOwned'] ?? $data['ownedItems'] ?? $data['owned_ids'] ?? []);
+      // itemsOwned puede venir en varios sitios/nombres
+      $owned_list = array_map('intval', array_filter([
+        ...(is_array($data['itemsOwned'] ?? null) ? $data['itemsOwned'] : []),
+        ...(is_array($data['ownedItems'] ?? null) ? $data['ownedItems'] : []),
+        ...(is_array($data['owned_ids'] ?? null) ? $data['owned_ids'] : []),
+        ...(is_array($data['data']['itemsOwned'] ?? null) ? $data['data']['itemsOwned'] : []),
+        ...(is_array($data['data']['ownedItems'] ?? null) ? $data['data']['ownedItems'] : []),
+      ]));
       if (!empty($owned_list)) {
-        $owned_ids = array_unique(array_merge($owned_ids, $owned_list));
+        $owned_ids = array_merge($owned_ids, $owned_list);
+      }
+
+      // Consolidar propiedad final
+      $owned_ids = array_values(array_unique(array_filter(array_map('intval', $owned_ids))));
+      if (!empty($owned_ids)) {
         $owned_set = array_flip($owned_ids);
         foreach ($items as &$it) {
           if (isset($owned_set[$it['id']])) {
@@ -119,7 +151,7 @@ add_action('rest_api_init', function () {
       $out = [
         'total'      => count($items),
         'owned'      => count(array_filter($items, fn($i) => !empty($i['is_owned']))),
-        'itemsOwned' => array_values(array_unique(array_filter($owned_ids))),
+        'itemsOwned' => $owned_ids,
         'items'      => $items,
       ];
 

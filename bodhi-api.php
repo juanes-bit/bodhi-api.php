@@ -2109,6 +2109,27 @@ function bodhi_ajax_login() {
   ], 200);
 }
 
+// === 1b) AJAX: refrescar nonce desde la app móvil (solo cookie, sin nonce previo) ===
+add_action('wp_ajax_bodhi_mobile_nonce', 'bodhi_mobile_nonce');
+add_action('wp_ajax_nopriv_bodhi_mobile_nonce', 'bodhi_mobile_nonce');
+function bodhi_mobile_nonce() {
+  nocache_headers();
+  if (!is_user_logged_in()) {
+    $uid = bodhi_validate_cookie_user();
+    if ($uid <= 0) {
+      wp_send_json_error(['message' => 'No autorizado'], 401);
+    }
+  }
+  $nonce = wp_create_nonce('wp_rest');
+  wp_send_json_success(['nonce' => $nonce], 200);
+}
+
+add_action('wp_login', function ($user_login, $user) {
+  if ($user instanceof WP_User) {
+    delete_transient('bodhi_mobile_my_courses_' . $user->ID);
+  }
+}, 10, 2);
+
 // === 2) /bodhi/v1/me — quién está logueado, valida por cookie ===
 add_action('rest_api_init', function(){
   register_rest_route('bodhi/v1', '/me', [
