@@ -94,6 +94,113 @@ add_action('rest_api_init', function () {
 });
 
 add_action('rest_api_init', function () {
+  register_rest_route('bodhi-mobile/v1', '/course/(?P<id>\\d+)', [
+    'methods'  => 'GET',
+    'permission_callback' => function () { return is_user_logged_in(); },
+    'callback' => function (WP_REST_Request $req) {
+
+      $course_id = intval($req->get_param('id'));
+      $user_id   = get_current_user_id();
+      if (!$course_id || !$user_id) {
+        return new WP_Error('bad_request', 'Faltan parámetros.', ['status' => 400]);
+      }
+
+      $r1 = rest_do_request(new WP_REST_Request('GET', "/bodhi/v1/courses/$course_id"));
+      if (is_wp_error($r1)) {
+        return $r1;
+      }
+      $c = $r1->get_data();
+
+      $r2 = new WP_REST_Request('GET', '/bodhi/v1/progress');
+      $r2->set_param('course_id', $course_id);
+      $p = rest_do_request($r2);
+      $progress = !is_wp_error($p) ? $p->get_data() : [];
+
+      $pick = function ($a, $keys, $def = '') {
+        foreach ($keys as $k) {
+          if (isset($a[$k])) {
+            return $a[$k];
+          }
+        }
+        return $def;
+      };
+
+      $title = (string) $pick($c, ['title', 'name', 'post_title'], '');
+      $image = (string) $pick($c, ['image', 'thumbnail', 'thumb', 'featured_image'], '');
+      $excerpt = (string) $pick($c, ['excerpt', 'summary', 'description'], '');
+
+      $modsSrc = [];
+      foreach (['modules', 'sections', 'units'] as $k) {
+        if (!empty($c[$k]) && is_array($c[$k])) {
+          $modsSrc = $c[$k];
+          break;
+        }
+      }
+
+      $modules = [];
+      $lessons_count = 0;
+
+      foreach ($modsSrc as $i => $m) {
+        $mlist = [];
+        $ls = [];
+        foreach (['lessons', 'items', 'children'] as $k) {
+          if (!empty($m[$k]) && is_array($m[$k])) {
+            $ls = $m[$k];
+            break;
+          }
+        }
+        foreach ($ls as $j => $L) {
+          $lid = intval($pick($L, ['id', 'lesson_id', 'post_id']));
+          $ltitle = (string) $pick($L, ['title', 'name', 'post_title'], "Lección $j");
+          $dur = intval($pick($L, ['duration', 'duration_sec', 'seconds'], 0));
+
+          $vimeo_id = (string) $pick($L, ['vimeo_id', 'vimeoId', 'video_id', 'videoid'], '');
+          $player_url = (string) $pick($L, ['vimeo_player', 'player_url', 'video_url', 'url'], '');
+          $thumb = (string) $pick($L, ['thumb', 'thumbnail', 'image'], '');
+
+          $mlist[] = [
+            'id'           => $lid,
+            'title'        => $ltitle,
+            'index'        => $j,
+            'duration_sec' => $dur,
+            'is_locked'    => false,
+            'vimeo'        => [
+              'id'         => $vimeo_id,
+              'player_url' => $player_url,
+              'thumb'      => $thumb,
+            ],
+          ];
+          $lessons_count++;
+        }
+
+        $modules[] = [
+          'id'      => intval($pick($m, ['id', 'module_id', 'post_id'], $i + 1)),
+          'title'   => (string) $pick($m, ['title', 'name', 'post_title'], 'Módulo ' . ($i + 1)),
+          'index'   => $i,
+          'lessons' => $mlist,
+        ];
+      }
+
+      $out = [
+        'id'            => $course_id,
+        'title'         => $title,
+        'image'         => $image,
+        'excerpt'       => $excerpt,
+        'percent'       => intval($pick($progress, ['percent', 'progress_percent'], 0)),
+        'modules_count' => count($modules),
+        'lessons_count' => $lessons_count,
+        'modules'       => $modules,
+        'progress'      => [
+          'percent'            => intval($pick($progress, ['percent', 'progress_percent'], 0)),
+          'completed_lessons'  => (array) $pick($progress, ['completed_lessons', 'done', 'completed'], []),
+        ],
+      ];
+
+      return rest_ensure_response($out);
+    },
+  ]);
+});
+add_action('rest_api_init', function () {
   register_rest_route('bm/v1', '/form-login', [
     'methods'  => 'POST',
     'permission_callback' => '__return_true',
